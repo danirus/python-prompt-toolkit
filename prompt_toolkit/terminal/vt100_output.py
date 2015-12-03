@@ -1,8 +1,9 @@
 from __future__ import unicode_literals
-from pygments.formatters.terminal256 import Terminal256Formatter, EscapeSequence
+from pygments.formatters.terminal256 import Terminal256Formatter
 
 from prompt_toolkit.layout.screen import Size
 from prompt_toolkit.renderer import Output
+from prompt_toolkit.styles import ANSI_COLOR_NAMES
 
 import array
 import errno
@@ -22,26 +23,105 @@ _tf = Terminal256Formatter()
 _DEBUG_RENDER_OUTPUT = False
 _DEBUG_RENDER_OUTPUT_FILENAME = '/tmp/prompt-toolkit-render-output'
 
+FG_ANSI_COLORS = {
+    'black':   30,
+    'default': 39,
+    'white':   97,
+
+    # Low intensity.
+    'red':     31,
+    'green':   32,
+    'yellow':  33,
+    'blue':    34,
+    'magenta': 35,
+    'cyan':    36,
+    'gray':    37,
+
+
+    # High intensity.
+    'dark-gray':      90,  # Bright black.
+    'bright-red':     91,
+    'bright-green':   92,
+    'bright-yellow':  93,
+    'bright-blue':    94,
+    'bright-magenta': 95,
+    'bright-cyan':    96,
+}
+
+BG_ANSI_COLORS = {
+    'black':   40,
+    'default': 49,
+    'white':   107,
+
+    # Low intensity.
+    'red':     41,
+    'green':   42,
+    'yellow':  43,
+    'blue':    44,
+    'magenta': 45,
+    'cyan':    46,
+    'gray':    47,
+
+    # High intensity.
+    'dark-gray':      100,  # bright black.
+    'bright-red':     101,
+    'bright-green':   102,
+    'bright-yellow':  103,
+    'bright-blue':    104,
+    'bright-magenta': 105,
+    'bright-cyan':    106,
+}
+
+assert set(FG_ANSI_COLORS) == set(ANSI_COLOR_NAMES)
+assert set(BG_ANSI_COLORS) == set(ANSI_COLOR_NAMES)
+
 
 class _EscapeCodeCache(dict):
     """
     Cache for VT100 escape codes. It maps
-    (fgcolor, bgcolor, bold, underline) tuples to VT100 escape sequences.
+    (fgcolor, bgcolor, bold, underline, reverse) tuples to VT100 escape sequences.
     """
     def __missing__(self, attrs):
-        fgcolor, bgcolor, bold, underline, reverse = attrs
+        fgcolor, bgcolor, bold, underline, italic, blink, reverse = attrs
 
-        fg = _tf._color_index(fgcolor) if fgcolor else None
-        bg = _tf._color_index(bgcolor) if bgcolor else None
+        parts = []
 
-        e = EscapeSequence(fg=fg, bg=bg, bold=bold, underline=underline).color_string()
-
-        # Add escape sequence for 'reverse'.
+        if fgcolor:
+            parts.extend(self._color_to_code(fgcolor))
+        if bgcolor:
+            parts.extend(self._color_to_code(bgcolor, True))
+        if bold:
+            parts.append('1')
+        if italic:
+            parts.append('3')
+        if blink:
+            parts.append('5')
+        if underline:
+            parts.append('4')
         if reverse:
-            e += '\x1b[7m'
+            parts.append('7')
 
-        self[attrs] = e
-        return e
+        if parts:
+            result = '\x1b[0;' + ';'.join(parts) + 'm'
+        else:
+            result = '\x1b[0m'
+
+        self[attrs] = result
+        return result
+
+    def _color_to_code(self, color, bg=False):
+       table = BG_ANSI_COLORS if bg else FG_ANSI_COLORS
+
+       # 16 ANSI colors.
+       if color in table:
+           result = (table[color], )
+
+       # 256 RGB colors.
+       else:
+           result = (48 if bg else 38, 5, _tf._color_index(color))
+
+       return map(six.text_type, result)
+
 
 _ESCAPE_CODE_CACHE = _EscapeCodeCache()
 
@@ -93,7 +173,7 @@ class Vt100_Output(Output):
 
         return cls(stdout, get_size)
 
-    def _write(self, data):
+    def write_raw(self, data):
         """
         Write raw data to output.
         """
@@ -102,14 +182,15 @@ class Vt100_Output(Output):
     def write(self, data):
         """
         Write text to output.
+        (Removes vt100 escape codes. -- used for safely writing text.)
         """
-        self._write(data.replace('\x1b', ''))
+        self._buffer.append(data.replace('\x1b', '?'))
 
     def set_title(self, title):
         """
         Set terminal title.
         """
-        self._write('\x1b]2;%s\x07' % title.replace('\x1b', '').replace('\x07', ''))
+        self.write_raw('\x1b]2;%s\x07' % title.replace('\x1b', '').replace('\x07', ''))
 
     def clear_title(self):
         self.set_title('')
@@ -119,46 +200,46 @@ class Vt100_Output(Output):
         Erases the screen with the background colour and moves the cursor to
         home.
         """
-        self._write('\x1b[2J')
+        self.write_raw('\x1b[2J')
 
     def enter_alternate_screen(self):
-        self._write('\x1b[?1049h\x1b[H')
+        self.write_raw('\x1b[?1049h\x1b[H')
 
     def quit_alternate_screen(self):
-        self._write('\x1b[?1049l')
+        self.write_raw('\x1b[?1049l')
 
     def enable_mouse_support(self):
-        self._write('\x1b[?1000h')
+        self.write_raw('\x1b[?1000h')
 
         # Enable urxvt Mouse mode. (For terminals that understand this.)
-        self._write('\x1b[?1015h')
+        self.write_raw('\x1b[?1015h')
 
         # Also enable Xterm SGR mouse mode. (For terminals that understand this.)
-        self._write('\x1b[?1006h')
+        self.write_raw('\x1b[?1006h')
 
         # Note: E.g. lxterminal understands 1000h, but not the urxvt or sgr
         #       extensions.
 
     def disable_mouse_support(self):
-        self._write('\x1b[?1000l')
-        self._write('\x1b[?1015l')
-        self._write('\x1b[?1006l')
+        self.write_raw('\x1b[?1000l')
+        self.write_raw('\x1b[?1015l')
+        self.write_raw('\x1b[?1006l')
 
     def erase_end_of_line(self):
         """
         Erases from the current cursor position to the end of the current line.
         """
-        self._write('\x1b[K')
+        self.write_raw('\x1b[K')
 
     def erase_down(self):
         """
         Erases the screen from the current line down to the bottom of the
         screen.
         """
-        self._write('\x1b[J')
+        self.write_raw('\x1b[J')
 
     def reset_attributes(self):
-        self._write('\x1b[0m')
+        self.write_raw('\x1b[0m')
 
     def set_attributes(self, attrs):
         """
@@ -169,57 +250,63 @@ class Vt100_Output(Output):
         escape_code = _ESCAPE_CODE_CACHE[attrs]
 
         self.reset_attributes()
-        self._write(escape_code)
+        self.write_raw(escape_code)
 
     def disable_autowrap(self):
-        self._write('\x1b[?7l')
+        self.write_raw('\x1b[?7l')
 
     def enable_autowrap(self):
-        self._write('\x1b[?7h')
+        self.write_raw('\x1b[?7h')
+
+    def enable_bracketed_paste(self):
+        self.write_raw('\x1b[?2004h')
+
+    def disable_bracketed_paste(self):
+        self.write_raw('\x1b[?2004l')
 
     def cursor_goto(self, row=0, column=0):
         """ Move cursor position. """
-        self._write('\x1b[%i;%iH' % (row, column))
+        self.write_raw('\x1b[%i;%iH' % (row, column))
 
     def cursor_up(self, amount):
         if amount == 0:
-            self._write('')
+            self.write_raw('')
         elif amount == 1:
-            self._write('\x1b[A')
+            self.write_raw('\x1b[A')
         else:
-            self._write('\x1b[%iA' % amount)
+            self.write_raw('\x1b[%iA' % amount)
 
     def cursor_down(self, amount):
         if amount == 0:
-            self._write('')
+            self.write_raw('')
         elif amount == 1:
             # Note: Not the same as '\n', '\n' can cause the window content to
             #       scroll.
-            self._write('\x1b[B')
+            self.write_raw('\x1b[B')
         else:
-            self._write('\x1b[%iB' % amount)
+            self.write_raw('\x1b[%iB' % amount)
 
     def cursor_forward(self, amount):
         if amount == 0:
-            self._write('')
+            self.write_raw('')
         elif amount == 1:
-            self._write('\x1b[C')
+            self.write_raw('\x1b[C')
         else:
-            self._write('\x1b[%iC' % amount)
+            self.write_raw('\x1b[%iC' % amount)
 
     def cursor_backward(self, amount):
         if amount == 0:
-            self._write('')
+            self.write_raw('')
         elif amount == 1:
-            self._write('\b')  # '\x1b[D'
+            self.write_raw('\b')  # '\x1b[D'
         else:
-            self._write('\x1b[%iD' % amount)
+            self.write_raw('\x1b[%iD' % amount)
 
     def hide_cursor(self):
-        self._write('\x1b[?25l')
+        self.write_raw('\x1b[?25l')
 
     def show_cursor(self):
-        self._write('\x1b[?12l\x1b[?25h')  # Stop blinking cursor and show.
+        self.write_raw('\x1b[?12l\x1b[?25h')  # Stop blinking cursor and show.
 
     def flush(self):
         """
@@ -266,5 +353,5 @@ class Vt100_Output(Output):
         """
         Asks for a cursor position report (CPR).
         """
-        self._write('\x1b[6n')
+        self.write_raw('\x1b[6n')
         self.flush()

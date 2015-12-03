@@ -319,6 +319,11 @@ def load_basic_bindings(registry, filter=Always()):
         # Report absolute cursor position to the renderer.
         event.cli.renderer.report_absolute_cursor_row(row)
 
+    @registry.add_binding(Keys.BracketedPaste)
+    def _(event):
+        " Pasting from clipboard. "
+        event.current_buffer.insert_text(event.data)
+
     @registry.add_binding(Keys.Vt100MouseEvent)
     def _(event):
         """
@@ -375,7 +380,7 @@ def load_basic_bindings(registry, filter=Always()):
         y -= 1
 
         # Only handle mouse events when we know the window height.
-        if event.cli.renderer.height_is_known:
+        if event.cli.renderer.height_is_known and mouse_event is not None:
             # Take region above the layout into account. The reported
             # coordinates are absolute to the visible part of the terminal.
             try:
@@ -421,7 +426,7 @@ def load_abort_and_exit_bindings(registry, filter=Always()):
     @handle(Keys.ControlC)
     def _(event):
         " Abort when Control-C has been pressed. "
-        event.cli.set_abort()
+        event.cli.abort()
 
     @Condition
     def ctrl_d_condition(cli):
@@ -433,7 +438,7 @@ def load_abort_and_exit_bindings(registry, filter=Always()):
     @handle(Keys.ControlD, filter=ctrl_d_condition)
     def _(event):
         " Exit on Control-D when the input is empty. "
-        event.cli.set_exit()
+        event.cli.exit()
 
 
 def load_basic_system_bindings(registry, filter=Always()):

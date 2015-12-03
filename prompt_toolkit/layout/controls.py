@@ -12,7 +12,7 @@ from prompt_toolkit.filters import to_cli_filter
 from prompt_toolkit.mouse_events import MouseEventTypes
 from prompt_toolkit.search_state import SearchState
 from prompt_toolkit.selection import SelectionType
-from prompt_toolkit.utils import get_cwidth
+from prompt_toolkit.utils import get_cwidth, SimpleLRUCache
 
 from .lexers import Lexer, SimpleLexer
 from .processors import Processor, Transformation
@@ -69,6 +69,7 @@ class UIControl(with_metaclass(ABCMeta, object)):
         handled by the `UIControl` itself. The `Window` or key bindings can
         decide to handle this event as scrolling or changing focus.
 
+        :param cli: `CommandLineInterface` instance.
         :param mouse_event: `MouseEvent` instance.
         """
         return NotImplemented
@@ -86,46 +87,28 @@ class UIControl(with_metaclass(ABCMeta, object)):
         """
 
 
-class _SimpleLRUCache(object):
-    """
-    Very simple LRU cache.
-
-    :param maxsize: Maximum size of the cache. (Don't make it too big.)
-    """
-    def __init__(self, maxsize=8):
-        self.maxsize = maxsize
-        self._cache = []  # List of (key, value).
-
-    def get(self, key, getter_func):
-        """
-        Get object from the cache.
-        If not found, call `getter_func` to resolve it, and put that on the top
-        of the cache instead.
-        """
-        # Look in cache first.
-        for k, v in self._cache:
-            if k == key:
-                return v
-
-        # Not found? Get it.
-        value = getter_func()
-        self._cache.append((key, value))
-
-        if len(self._cache) > self.maxsize:
-            self._cache = self._cache[-self.maxsize:]
-
-        return value
-
-
 class TokenListControl(UIControl):
     """
     Control that displays a list of (Token, text) tuples.
+    (It's mostly optimized for rather small widgets, like toolbars, menus, etc...)
+
+    Mouse support:
+
+        The list of tokens can also contain tuples of three items, looking like:
+        (Token, text, handler). When mouse support is enabled and the user
+        clicks on this token, then the given handler is called. That handler
+        should accept two inputs: (CommandLineInterface, MouseEvent) and it
+        should either handle the event or return `NotImplemented` in case we
+        want the containing Window to handle this event.
 
     :param get_tokens: Callable that takes a `CommandLineInterface` instance
         and returns the list of (Token, text) tuples to be displayed right now.
     :param default_char: default :class:`.Char` (character and Token) to use
         for the background when there is more space available than `get_tokens`
         returns.
+    :param get_default_char: Like `default_char`, but this is a callable that
+        takes a :class:`prompt_toolkit.interface.CommandLineInterface` and
+        returns a :class:`.Char` instance.
     :param has_focus: `bool` or `CLIFilter`, when this evaluates to `True`,
         this UI control will take the focus. The cursor will be shown in the
         upper left corner of this control, unless `get_token` returns a
@@ -133,19 +116,49 @@ class TokenListControl(UIControl):
         cursor will be shown there.
     :param wrap_lines: `bool` or `CLIFilter`: Wrap long lines.
     """
-    def __init__(self, get_tokens, default_char=None, align_right=False, align_center=False,
+    def __init__(self, get_tokens, default_char=None, get_default_char=None,
+                 align_right=False, align_center=False,
                  has_focus=False, wrap_lines=True):
         assert default_char is None or isinstance(default_char, Char)
+        assert get_default_char is None or callable(get_default_char)
+        assert not (default_char and get_default_char)
 
-        self.get_tokens = get_tokens
-        self.default_char = default_char or Char(' ', Token)
         self.align_right = to_cli_filter(align_right)
         self.align_center = to_cli_filter(align_center)
         self._has_focus_filter = to_cli_filter(has_focus)
         self.wrap_lines = to_cli_filter(wrap_lines)
 
+        self.get_tokens = get_tokens
+
+        # Construct `get_default_char` callable.
+        if default_char:
+            get_default_char = lambda _: default_char
+        elif not get_default_char:
+            get_default_char = lambda _: Char(' ', Token)
+
+        self.get_default_char = get_default_char
+
+        #: Cache for rendered screens.
+        self._screen_lru_cache = SimpleLRUCache(maxsize=18)
+        self._token_lru_cache = SimpleLRUCache(maxsize=1)
+            # Only cache one token list. We don't need the previous item.
+
+        # Render info for the mouse support.
+        self._tokens = None  # The last rendered tokens.
+        self._pos_to_indexes = None  # Mapping from mouse positions (x,y) to
+                                     # positions in the token list.
+
     def __repr__(self):
         return '%s(%r)' % (self.__class__.__name__, self.get_tokens)
+
+    def _get_tokens_cached(self, cli):
+        """
+        Get tokens, but only retrieve tokens once during one render run.
+        (This function is called several times during one rendering, because
+        we also need those for calculating the dimensions.)
+        """
+        return self._token_lru_cache.get(
+            cli.render_counter, lambda: self.get_tokens(cli))
 
     def has_focus(self, cli):
         return self._has_focus_filter(cli)
@@ -155,7 +168,7 @@ class TokenListControl(UIControl):
         Return the preferred width for this control.
         That is the width of the longest line.
         """
-        text = ''.join(t[1] for t in self.get_tokens(cli))
+        text = ''.join(t[1] for t in self._get_tokens_cached(cli))
         line_lengths = [get_cwidth(l) for l in text.split('\n')]
         return max(line_lengths)
 
@@ -164,27 +177,42 @@ class TokenListControl(UIControl):
         return screen.height
 
     def create_screen(self, cli, width, height):
-        screen = Screen(self.default_char, initial_width=width)
-
         # Get tokens
-        tokens = self.get_tokens(cli)
+        tokens_with_mouse_handlers = self._get_tokens_cached(cli)
+
+        default_char = self.get_default_char(cli)
+
+        # Strip mouse handlers from tokens.
+        tokens = [tuple(item[:2]) for item in tokens_with_mouse_handlers]
+
+        # Wrap/align right/center parameters.
         wrap_lines = self.wrap_lines(cli)
+        right = self.align_right(cli)
+        center = self.align_center(cli)
+
+        # Create screen, or take it from the cache.
+        key = (default_char, tokens_with_mouse_handlers, width, wrap_lines, right, center)
+        params = (default_char, tokens, width, wrap_lines, right, center)
+        screen, self._pos_to_indexes = self._screen_lru_cache.get(key, lambda: self._get_screen(*params))
+
+        self._tokens = tokens_with_mouse_handlers
+        return screen
+
+    @classmethod
+    def _get_screen(cls, default_char, tokens, width, wrap_lines, right, center):
+        screen = Screen(default_char, initial_width=width)
 
         # Only call write_data when we actually have tokens.
         # (Otherwise the screen height will go up from 0 to 1 while we don't
         # want that. -- An empty control should not take up any space.)
         if tokens:
-            # Align right/center.
-            right = self.align_right(cli)
-            center = self.align_center(cli)
-
             def process_line(line):
                 " Center or right align a single line. "
                 used_width = token_list_width(line)
                 padding = width - used_width
                 if center:
                     padding = int(padding / 2)
-                return [(self.default_char.token, self.default_char.char * padding)] + line + [(Token, '\n')]
+                return [(default_char.token, default_char.char * padding)] + line + [(Token, '\n')]
 
             if right or center:
                 tokens2 = []
@@ -192,14 +220,49 @@ class TokenListControl(UIControl):
                     tokens2.extend(process_line(line))
                 tokens = tokens2
 
-            screen.write_data(tokens, width=(width if wrap_lines else None))
-        return screen
+            indexes_to_pos = screen.write_data(tokens, width=(width if wrap_lines else None))
+            pos_to_indexes = dict((v, k) for k, v in indexes_to_pos.items())
+        else:
+            pos_to_indexes = {}
+
+        return screen, pos_to_indexes
 
     @classmethod
     def static(cls, tokens):
         def get_static_tokens(cli):
             return tokens
         return cls(get_static_tokens)
+
+    def mouse_handler(self, cli, mouse_event):
+        """
+        Handle mouse events.
+
+        (When the token list contained mouse handlers and the user clicked on
+        on any of these, the matching handler is called. This handler can still
+        return `NotImplemented` in case we want the `Window` to handle this
+        particular event.)
+        """
+        if self._pos_to_indexes:
+            # Find position in the token list.
+            position = mouse_event.position
+            index = self._pos_to_indexes.get((position.x, position.y))
+
+            if index is not None:
+                # Find mouse handler for this character.
+                count = 0
+                for item in self._tokens:
+                    count += len(item[1])
+                    if count >= index:
+                        if len(item) >= 3:
+                            # Handler found. Call it.
+                            handler = item[2]
+                            handler(cli, mouse_event)
+                            return
+                        else:
+                            break
+
+        # Otherwise, don't handle here.
+        return NotImplemented
 
 
 class FillControl(UIControl):
@@ -264,12 +327,12 @@ class BufferControl(UIControl):
         #: Often, due to cursor movement, undo/redo and window resizing
         #: operations, it happens that a short time, the same document has to be
         #: lexed. This is a faily easy way to cache such an expensive operation.
-        self._token_lru_cache = _SimpleLRUCache(maxsize=8)
+        self._token_lru_cache = SimpleLRUCache(maxsize=8)
 
         #: Keep a similar cache for rendered screens. (when we scroll up/down
         #: through the screen, or when we change another buffer, we don't want
         #: to recreate the same screen again.)
-        self._screen_lru_cache = _SimpleLRUCache(maxsize=8)
+        self._screen_lru_cache = SimpleLRUCache(maxsize=8)
 
         self._xy_to_cursor_position = None
         self._last_click_timestamp = None

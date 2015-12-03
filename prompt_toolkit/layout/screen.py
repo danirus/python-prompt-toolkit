@@ -148,6 +148,8 @@ class Screen(object):
 
         :param data: List of Token tuples to write to the buffer.
         :param width: Width of the line wrap. (Don't wrap when `width` is None.)
+        :returns: A dictionary mapping the character positions of the input data to
+                  (x, y) coordinates.
         """
         if width is None:
             width = 10 ** 100  # A very big number.
@@ -233,8 +235,7 @@ class WritePosition(object):
         assert height >= 0
         assert extended_height is None or extended_height >= 0
         assert width >= 0
-        assert xpos >= 0
-        assert ypos >= 0
+        # xpos and ypos can be negative. (A float can be partially visible.)
 
         self.xpos = xpos
         self.ypos = ypos
@@ -243,6 +244,6 @@ class WritePosition(object):
         self.extended_height = extended_height or height
 
     def __repr__(self):
-        return '%s(%r, %r, %r %r, %r)' % (
+        return '%s(%r, %r, %r, %r, %r)' % (
             self.__class__.__name__,
             self.xpos, self.ypos, self.width, self.height, self.extended_height)

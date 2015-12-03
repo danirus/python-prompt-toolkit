@@ -191,9 +191,14 @@ class ConsoleInputReader(object):
 
         # Return result. If alt was pressed, prefix the result with an
         # 'Escape' key, just like unix VT100 terminals do.
+
+        # NOTE: Only replace the left alt with escape. The right alt key often
+        #       acts as altgr and is used in many non US keyboard layouts for
+        #       typing some special characters, like a backslash. We don't want
+        #       all backslashes to be prefixed with escape. (Esc-\ has a
+        #       meaning in E-macs, for instance.)
         if result:
-            meta_pressed = ev.ControlKeyState & self.LEFT_ALT_PRESSED or \
-                ev.ControlKeyState & self.RIGHT_ALT_PRESSED
+            meta_pressed = ev.ControlKeyState & self.LEFT_ALT_PRESSED
 
             if meta_pressed:
                 return [KeyPress(Keys.Escape, ''), result]

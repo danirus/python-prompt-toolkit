@@ -14,6 +14,7 @@ from .controls import UIControl, TokenListControl
 from .margins import Margin
 from prompt_toolkit.filters import to_cli_filter
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventTypes
+from prompt_toolkit.utils import SimpleLRUCache
 
 __all__ = (
     'Container',
@@ -75,18 +76,34 @@ class Container(with_metaclass(ABCMeta, object)):
         Walk through all the layout nodes (and their children) and yield them.
         """
 
+def _window_too_small():
+    " Create a `Window` that displays the 'Window too small' text. "
+    return Window(TokenListControl.static(
+        [(Token.WindowTooSmall, ' Window too small... ')]))
+
 
 class HSplit(Container):
     """
     Several layouts, one stacked above/under the other.
+
+    :param children: List of child :class:`.Container` objects.
+    :param window_too_small: A :class:`.Container` object that is displayed if
+        there is not enough space for all the children. By default, this is a
+        "Window too small" message.
     """
-    def __init__(self, children):
+    def __init__(self, children, window_too_small=None):
         assert all(isinstance(c, Container) for c in children)
+        assert window_too_small is None or isinstance(window_too_small, Container)
+
         self.children = children
+        self.window_too_small = window_too_small or _window_too_small()
 
     def preferred_width(self, cli, max_available_width):
-        dimensions = [c.preferred_width(cli, max_available_width) for c in self.children]
-        return max_layout_dimensions(dimensions)
+        if self.children:
+            dimensions = [c.preferred_width(cli, max_available_width) for c in self.children]
+            return max_layout_dimensions(dimensions)
+        else:
+            return LayoutDimension(0)
 
     def preferred_height(self, cli, width):
         dimensions = [c.preferred_height(cli, width) for c in self.children]
@@ -108,8 +125,10 @@ class HSplit(Container):
         sum_dimensions = sum_layout_dimensions(dimensions)
 
         # If there is not enough space for both.
-        # Don't do anything. (TODO: show window too small message.)
+        # Don't do anything.
         if sum_dimensions.min > write_position.extended_height:
+            self.window_too_small.write_to_screen(
+                cli, screen, mouse_handlers, write_position)
             return
 
         # Find optimal sizes. (Start with minimal size, increase until we cover
@@ -150,10 +169,18 @@ class HSplit(Container):
 class VSplit(Container):
     """
     Several layouts, one stacked left/right of the other.
+
+    :param children: List of child :class:`.Container` objects.
+    :param window_too_small: A :class:`.Container` object that is displayed if
+        there is not enough space for all the children. By default, this is a
+        "Window too small" message.
     """
-    def __init__(self, children):
+    def __init__(self, children, window_too_small=None):
         assert all(isinstance(c, Container) for c in children)
+        assert window_too_small is None or isinstance(window_too_small, Container)
+
         self.children = children
+        self.window_too_small = window_too_small or _window_too_small()
 
     def preferred_width(self, cli, max_available_width):
         dimensions = [c.preferred_width(cli, max_available_width) for c in self.children]
@@ -182,7 +209,7 @@ class VSplit(Container):
         sum_dimensions = sum_layout_dimensions(dimensions)
 
         # If there is not enough space for both.
-        # Don't do anything. (TODO: show window too small message.)
+        # Don't do anything.
         if sum_dimensions.min > width:
             return
 
@@ -211,7 +238,10 @@ class VSplit(Container):
 
         sizes = self._divide_widths(cli, write_position.width)
 
+        # If there is not enough space.
         if sizes is None:
+            self.window_too_small.write_to_screen(
+                cli, screen, mouse_handlers, write_position)
             return
 
         # Calculate heights, take the largest possible, but not larger than write_position.extended_height.
@@ -284,20 +314,23 @@ class FloatContainer(Container):
                                 y=cursor_position.y - write_position.ypos)
 
         for fl in self.floats:
+            fl_width = fl.get_width(cli)
+            fl_height = fl.get_height(cli)
+
             # Left & width given.
-            if fl.left is not None and fl.width is not None:
+            if fl.left is not None and fl_width is not None:
                 xpos = fl.left
-                width = fl.width
+                width = fl_width
             # Left & right given -> calculate width.
             elif fl.left is not None and fl.right is not None:
                 xpos = fl.left
                 width = write_position.width - fl.left - fl.right
             # Width & right given -> calculate left.
-            elif fl.width is not None and fl.right is not None:
-                xpos = write_position.width - fl.right - fl.width
-                width = fl.width
+            elif fl_width is not None and fl.right is not None:
+                xpos = write_position.width - fl.right - fl_width
+                width = fl_width
             elif fl.xcursor:
-                width = fl.width
+                width = fl_width
                 if width is None:
                     width = fl.content.preferred_width(cli, write_position.width).preferred
                     width = min(write_position.width, width)
@@ -306,9 +339,9 @@ class FloatContainer(Container):
                 if xpos + width > write_position.width:
                     xpos = max(0, write_position.width - width)
             # Only width given -> center horizontally.
-            elif fl.width:
-                xpos = int((write_position.width - fl.width) / 2)
-                width = fl.width
+            elif fl_width:
+                xpos = int((write_position.width - fl_width) / 2)
+                width = fl_width
             # Otherwise, take preferred width from float content.
             else:
                 width = fl.content.preferred_width(cli, write_position.width).preferred
@@ -324,22 +357,22 @@ class FloatContainer(Container):
                 width = min(width, write_position.width - xpos)
 
             # Top & height given.
-            if fl.top is not None and fl.height is not None:
+            if fl.top is not None and fl_height is not None:
                 ypos = fl.top
-                height = fl.height
+                height = fl_height
             # Top & bottom given -> calculate height.
             elif fl.top is not None and fl.bottom is not None:
                 ypos = fl.top
                 height = write_position.height - fl.top - fl.bottom
             # Height & bottom given -> calculate top.
-            elif fl.height is not None and fl.bottom is not None:
-                ypos = write_position.height - fl.height - fl.bottom
-                height = fl.height
+            elif fl_height is not None and fl.bottom is not None:
+                ypos = write_position.height - fl_height - fl.bottom
+                height = fl_height
             # Near cursor
             elif fl.ycursor:
                 ypos = cursor_position.y + 1
 
-                height = fl.height
+                height = fl_height
                 if height is None:
                     height = fl.content.preferred_height(cli, width).preferred
 
@@ -356,9 +389,9 @@ class FloatContainer(Container):
                         ypos = cursor_position.y - height
 
             # Only height given -> center vertically.
-            elif fl.width:
-                ypos = int((write_position.height - fl.height) / 2)
-                height = fl.height
+            elif fl_width:
+                ypos = int((write_position.height - fl_height) / 2)
+                height = fl_height
             # Otherwise, take preferred height from content.
             else:
                 height = fl.content.preferred_height(cli, width).preferred
@@ -374,7 +407,8 @@ class FloatContainer(Container):
                 height = min(height, write_position.height - ypos)
 
             # Write float.
-            if xpos >= 0 and ypos >= 0 and height > 0 and width > 0:
+            # (xpos and ypos can be negative: a float can be partially visible.)
+            if height > 0 and width > 0:
                 wp = WritePosition(xpos=xpos + write_position.xpos,
                                    ypos=ypos + write_position.ypos,
                                    width=width, height=height)
@@ -393,23 +427,45 @@ class FloatContainer(Container):
 
 
 class Float(object):
+    """
+    Float for use in a :class:`.FloatContainer`.
+
+    :param content: :class:`.Container` instance.
+    """
     def __init__(self, top=None, right=None, bottom=None, left=None,
-                 width=None, height=None,
+                 width=None, height=None, get_width=None, get_height=None,
                  xcursor=False, ycursor=False, content=None):
         assert isinstance(content, Container)
+        assert width is None or get_width is None
+        assert height is None or get_height is None
 
         self.left = left
         self.right = right
         self.top = top
         self.bottom = bottom
 
-        self.width = width
-        self.height = height
+        self._width = width
+        self._height = height
+
+        self._get_width = get_width
+        self._get_height = get_height
 
         self.xcursor = xcursor
         self.ycursor = ycursor
 
         self.content = content
+
+    def get_width(self, cli):
+        if self._width:
+            return self._width
+        if self._get_width:
+            return self._get_width(cli)
+
+    def get_height(self, cli):
+        if self._height:
+            return self._height
+        if self._get_height:
+            return self._get_height(cli)
 
     def __repr__(self):
         return 'Float(content=%r)' % self.content
@@ -595,16 +651,28 @@ class Window(Container):
         preferred amount of lines/columns to be always visible before/after the
         cursor. When both top and bottom are a very high number, the cursor
         will be centered vertically most of the time.
-    :param allow_scroll_beyond_bottom: A `bool` or `Filter` instance. When
-         True, allow scrolling so far, that the top part of the content is not
-         visible anymore, while there is still empty space available at the
-         bottom of the window. In the Vi editor for instance, this is possible.
-         You will see tildes while the top part of the body is hidden.
+    :param allow_scroll_beyond_bottom: A `bool` or
+        :class:`~prompt_toolkit.filters.CLIFilter` instance. When True, allow
+        scrolling so far, that the top part of the content is not visible
+        anymore, while there is still empty space available at the bottom of
+        the window. In the Vi editor for instance, this is possible. You will
+        see tildes while the top part of the body is hidden.
+    :param get_vertical_scroll: Callable that takes this window
+        instance as input and returns a preferred vertical scroll.
+        (When this is `None`, the scroll is only determined by the last and
+        current cursor position.)
+    :param get_horizontal_scroll: Callable that takes this window
+        instance as input and returns a preferred vertical scroll.
+    :param always_hide_cursor: A `bool` or
+        :class:`~prompt_toolkit.filters.CLIFilter` instance. When True, never
+        display the cursor, even when the user control specifies a cursor
+        position.
     """
     def __init__(self, content, width=None, height=None, get_width=None,
                  get_height=None, dont_extend_width=False, dont_extend_height=False,
                  left_margins=None, right_margins=None, scroll_offsets=None,
-                 allow_scroll_beyond_bottom=False):
+                 allow_scroll_beyond_bottom=False,
+                 get_vertical_scroll=None, get_horizontal_scroll=None, always_hide_cursor=False):
         assert isinstance(content, UIControl)
         assert width is None or isinstance(width, LayoutDimension)
         assert height is None or isinstance(height, LayoutDimension)
@@ -615,8 +683,11 @@ class Window(Container):
         assert scroll_offsets is None or isinstance(scroll_offsets, ScrollOffsets)
         assert left_margins is None or all(isinstance(m, Margin) for m in left_margins)
         assert right_margins is None or all(isinstance(m, Margin) for m in right_margins)
+        assert get_vertical_scroll is None or callable(get_vertical_scroll)
+        assert get_horizontal_scroll is None or callable(get_horizontal_scroll)
 
         self.allow_scroll_beyond_bottom = to_cli_filter(allow_scroll_beyond_bottom)
+        self.always_hide_cursor = to_cli_filter(always_hide_cursor)
 
         self.content = content
         self.dont_extend_width = dont_extend_width
@@ -624,8 +695,13 @@ class Window(Container):
         self.left_margins = left_margins or []
         self.right_margins = right_margins or []
         self.scroll_offsets = scroll_offsets or ScrollOffsets()
+        self.get_vertical_scroll = get_vertical_scroll
+        self.get_horizontal_scroll = get_horizontal_scroll
         self._width = get_width or (lambda cli: width)
         self._height = get_height or (lambda cli: height)
+
+        # Cache for the screens generated by the margin.
+        self._margin_cache = SimpleLRUCache(maxsize=8)
 
         self.reset()
 
@@ -765,9 +841,17 @@ class Window(Container):
 
         def render_margin(m, width):
             " Render margin. return `Screen`. "
-            control = TokenListControl(
-                lambda _: m.create_margin(cli, self.render_info, width, write_position.height))
-            return control.create_screen(cli, width + 1, write_position.height)
+            # Retrieve margin tokens.
+            tokens = m.create_margin(cli, self.render_info, width, write_position.height)
+
+            # Turn it into a screen. (Take a screen from the cache if we
+            # already rendered those tokens using this size.)
+            def create_screen():
+                return TokenListControl.static(tokens).create_screen(
+                    cli, width + 1, write_position.height)
+
+            key = (tokens, width, write_position.height)
+            return self._margin_cache.get(key, create_screen)
 
         for m, width in zip(self.left_margins, left_margin_widths):
             # Create screen for margin.
@@ -825,7 +909,9 @@ class Window(Container):
         if self.content.has_focus(cli):
             new_screen.cursor_position = Point(y=temp_screen.cursor_position.y + ypos - self.vertical_scroll,
                                                x=temp_screen.cursor_position.x + xpos - self.horizontal_scroll)
-            new_screen.show_cursor = temp_screen.show_cursor
+
+            if not self.always_hide_cursor(cli):
+                new_screen.show_cursor = temp_screen.show_cursor
 
         if not new_screen.menu_position and temp_screen.menu_position:
             new_screen.menu_position = Point(y=temp_screen.menu_position.y + ypos - self.vertical_scroll,
@@ -895,6 +981,16 @@ class Window(Container):
 
             return current_scroll, scroll_offset_start, scroll_offset_end
 
+        # When a preferred scroll is given, take that first into account.
+        if self.get_vertical_scroll:
+            self.vertical_scroll = self.get_vertical_scroll(self)
+            assert isinstance(self.vertical_scroll, int)
+        if self.get_horizontal_scroll:
+            self.horizontal_scroll = self.get_horizontal_scroll(self)
+            assert isinstance(self.horizontal_scroll, int)
+
+        # Update horizontal/vertical scroll to make sure that the cursor
+        # remains visible.
         offsets = self.scroll_offsets
 
         self.vertical_scroll, scroll_offset_top, scroll_offset_bottom  = do_scroll(

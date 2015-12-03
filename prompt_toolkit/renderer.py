@@ -135,8 +135,8 @@ def output_screen_diff(output, screen, current_pos, previous_screen=None, last_c
         new_row = screen.data_buffer[r]
         previous_row = previous_screen.data_buffer[r]
 
-        new_max_line_len = max(new_row.keys()) if new_row else 0
-        previous_max_line_len = max(previous_row.keys()) if previous_row else 0
+        new_max_line_len = min(width - 1, max(new_row.keys()) if new_row else 0)
+        previous_max_line_len = min(width - 1, max(previous_row.keys()) if previous_row else 0)
 
         # Loop over the columns.
         c = 0
@@ -155,7 +155,7 @@ def output_screen_diff(output, screen, current_pos, previous_screen=None, last_c
 
             c += char_width
 
-        # If the new line is shorter, trim it
+        # If the new line is shorter, trim it.
         if previous_screen and new_max_line_len < previous_max_line_len:
             current_pos = move_cursor(Point(y=y, x=new_max_line_len+1))
             reset_attributes()
@@ -240,6 +240,7 @@ class Renderer(object):
 
         self._in_alternate_screen = False
         self._mouse_support_enabled = False
+        self._bracketed_paste_enabled = False
 
         self.reset(_scroll=True)
 
@@ -284,6 +285,10 @@ class Renderer(object):
         if self._mouse_support_enabled:
             self.output.disable_mouse_support()
             self._mouse_support_enabled = False
+
+        # Disable bracketed paste.
+        if self._bracketed_paste_enabled:
+            self.output.disable_bracketed_paste()
 
         # Flush output. `disable_mouse_support` needs to write to stdout.
         self.output.flush()
@@ -359,6 +364,11 @@ class Renderer(object):
         if self.use_alternate_screen and not self._in_alternate_screen:
             self._in_alternate_screen = True
             output.enter_alternate_screen()
+
+        # Enable bracketed paste.
+        if not self._bracketed_paste_enabled:
+            self.output.enable_bracketed_paste()
+            self._bracketed_paste_enabled = True
 
         # Enable/disable mouse support.
         needs_mouse_support = self.mouse_support(cli)

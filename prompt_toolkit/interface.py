@@ -11,6 +11,7 @@ import sys
 import textwrap
 import threading
 import weakref
+import datetime
 
 from .application import Application, AbortAction
 from .buffer import Buffer, AcceptAction
@@ -86,6 +87,11 @@ class CommandLineInterface(object):
             self.output,
             use_alternate_screen=application.use_alternate_screen,
             mouse_support=application.mouse_support)
+
+        #: Render counter. This one is increased every time the UI is rendered.
+        #: It can be used as a key for caching certain information during one
+        #: rendering.
+        self.render_counter = 0
 
         # Invalidate flag. When 'True', a repaint has been scheduled.
         self._invalidated = False
@@ -272,7 +278,11 @@ class CommandLineInterface(object):
                 self._invalidated = False
                 self._redraw()
 
-            self.eventloop.call_from_executor(redraw)
+            # Call redraw in the eventloop (thread safe).
+            # Give it low priority. If there is other I/O or CPU intensive
+            # stuff to handle, give that priority, but max postpone x seconds.
+            _max_postpone_until = datetime.datetime.now() + datetime.timedelta(seconds=.5)
+            self.eventloop.call_from_executor(redraw, _max_postpone_until=_max_postpone_until)
 
     # Depracated alias for 'invalidate'.
     request_redraw = invalidate
@@ -284,6 +294,7 @@ class CommandLineInterface(object):
         """
         # Only draw when no sub application was started.
         if self._is_running and self._sub_cli is None:
+            self.render_counter += 1
             self.renderer.render(self, self.layout, is_done=self.is_done)
 
     def _on_resize(self):
@@ -444,15 +455,13 @@ class CommandLineInterface(object):
         sub_cli._redraw()
         self._sub_cli = sub_cli
 
-    def set_exit(self):
+    def exit(self):
         """
         Set exit. When Control-D has been pressed.
         """
         on_exit = self.application.on_exit
-
-        if on_exit != AbortAction.IGNORE:
-            self._exit_flag = True
-            self._redraw()
+        self._exit_flag = True
+        self._redraw()
 
         if on_exit == AbortAction.RAISE_EXCEPTION:
             def eof_error():
@@ -467,15 +476,13 @@ class CommandLineInterface(object):
         elif on_exit == AbortAction.RETURN_NONE:
             self.set_return_value(None)
 
-    def set_abort(self):
+    def abort(self):
         """
         Set abort. When Control-C has been pressed.
         """
         on_abort = self.application.on_abort
-
-        if on_abort != AbortAction.IGNORE:
-            self._abort_flag = True
-            self._redraw()
+        self._abort_flag = True
+        self._redraw()
 
         if on_abort == AbortAction.RAISE_EXCEPTION:
             def keyboard_interrupt():
@@ -489,6 +496,10 @@ class CommandLineInterface(object):
 
         elif on_abort == AbortAction.RETURN_NONE:
             self.set_return_value(None)
+
+    # Deprecated aliase for exit/abort.
+    set_exit = exit
+    set_abort = abort
 
     def set_return_value(self, document):
         """
@@ -740,22 +751,25 @@ class CommandLineInterface(object):
             self.eventloop.run_in_executor(run)
         return async_suggestor
 
-    def stdout_proxy(self):
+    def stdout_proxy(self, raw=False):
         """
         Create an :class:`_StdoutProxy` class which can be used as a patch for
-        sys.stdout. Writing to this proxy will make sure that the text appears
-        above the prompt, and that it doesn't destroy the output from the
-        renderer.
-        """
-        return _StdoutProxy(self)
+        `sys.stdout`. Writing to this proxy will make sure that the text
+        appears above the prompt, and that it doesn't destroy the output from
+        the renderer.
 
-    def patch_stdout_context(self):
+        :param raw: (`bool`) When True, vt100 terminal escape sequences are not
+                    removed/escaped.
+        """
+        return _StdoutProxy(self, raw=raw)
+
+    def patch_stdout_context(self, raw=False):
         """
         Return a context manager that will replace ``sys.stdout`` with a proxy
         that makes sure that all printed text will appear above the prompt, and
         that it doesn't destroy the output from the renderer.
         """
-        return _PatchStdoutContext(self.stdout_proxy())
+        return _PatchStdoutContext(self.stdout_proxy(raw=raw))
 
     def create_eventloop_callbacks(self):
         return _InterfaceEventLoopCallbacks(self)
@@ -818,9 +832,13 @@ class _StdoutProxy(object):
     Proxy for stdout, as returned by
     :class:`CommandLineInterface.stdout_proxy`.
     """
-    def __init__(self, cli):
+    def __init__(self, cli, raw=False):
+        assert isinstance(cli, CommandLineInterface)
+        assert isinstance(raw, bool)
+
         self._lock = threading.RLock()
         self._cli = cli
+        self._raw = raw
         self._buffer = []
 
         self.errors = sys.__stdout__.errors
@@ -852,7 +870,10 @@ class _StdoutProxy(object):
 
             def run():
                 for s in to_write:
-                    self._cli.output.write(s)
+                    if self._raw:
+                        self._cli.output.write_raw(s)
+                    else:
+                        self._cli.output.write(s)
             self._do(run)
         else:
             # Otherwise, cache in buffer.
@@ -911,8 +932,9 @@ class _SubApplicationEventLoop(EventLoop):
     def run_in_executor(self, callback):
         self.cli.eventloop.run_in_executor(callback)
 
-    def call_from_executor(self, callback):
-        self.cli.eventloop.call_from_executor(callback)
+    def call_from_executor(self, callback, _max_postpone_until=None):
+        self.cli.eventloop.call_from_executor(
+            callback, _max_postpone_until=_max_postpone_until)
 
     def add_reader(self, fd, callback):
         self.cli.eventloop.add_reader(fd, callback)
