@@ -73,6 +73,12 @@ Installation
 
     pip install prompt-toolkit
 
+For Conda, do:
+
+::
+
+    conda install -c https://conda.anaconda.org/conda-forge prompt_toolkit
+
 
 Getting started
 ***************
@@ -110,6 +116,7 @@ Projects using prompt-toolkit
 - `cycli <https://github.com/nicolewhite/cycli>`_:  A Command Line Interface for Cypher.
 - `crash <https://github.com/crate/crash>`_:  Crate command line client.
 - `vcli <https://github.com/dbcli/vcli>`_: Vertica client.
+- `aws-shell <https://github.com/awslabs/aws-shell>`_: An integrated shell for working with the AWS CLI.
 
 
 (Want your own project to be listed here? Please create a GitHub issue.)

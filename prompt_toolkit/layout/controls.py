@@ -4,16 +4,18 @@ User interface Controls for the layout.
 from __future__ import unicode_literals
 from pygments.token import Token
 
-from six import with_metaclass
 from abc import ABCMeta, abstractmethod
+from collections import defaultdict, namedtuple
+from six import with_metaclass
 
-from prompt_toolkit.enums import DEFAULT_BUFFER
+from prompt_toolkit.enums import DEFAULT_BUFFER, SEARCH_BUFFER
 from prompt_toolkit.filters import to_cli_filter
 from prompt_toolkit.mouse_events import MouseEventTypes
 from prompt_toolkit.search_state import SearchState
 from prompt_toolkit.selection import SelectionType
 from prompt_toolkit.utils import get_cwidth, SimpleLRUCache
 
+from .highlighters import Highlighter
 from .lexers import Lexer, SimpleLexer
 from .processors import Processor, Transformation
 from .screen import Screen, Char, Point
@@ -58,8 +60,13 @@ class UIControl(with_metaclass(ABCMeta, object)):
     def create_screen(self, cli, width, height):
         """
         Write the content at this position to the screen.
+
+        Returns a :class:`.Screen` instance.
+
+        Optionally, this can also return a (screen, highlighting) tuple, where
+        the `highlighting` is a dictionary of dictionaries. Mapping
+        y->x->Token if this position needs to be highlighted with that Token.
         """
-        pass
 
     def mouse_handler(self, cli, mouse_event):
         """
@@ -220,7 +227,9 @@ class TokenListControl(UIControl):
                     tokens2.extend(process_line(line))
                 tokens = tokens2
 
-            indexes_to_pos = screen.write_data(tokens, width=(width if wrap_lines else None))
+            write_data_result = screen.write_data(tokens, width=(width if wrap_lines else None))
+
+            indexes_to_pos = write_data_result.indexes_to_pos
             pos_to_indexes = dict((v, k) for k, v in indexes_to_pos.items())
         else:
             pos_to_indexes = {}
@@ -297,31 +306,44 @@ class BufferControl(UIControl):
     :param input_processors: list of :class:`~prompt_toolkit.layout.processors.Processor`.
     :param lexer: :class:`~prompt_toolkit.layout.lexers.Lexer` instance for syntax highlighting.
     :param preview_search: `bool` or `CLIFilter`: Show search while typing.
+    :param get_search_state: Callable that takes a CommandLineInterface and
+        returns the SearchState to be used. (If not CommandLineInterface.search_state.)
     :param wrap_lines: `bool` or `CLIFilter`: Wrap long lines.
     :param buffer_name: String representing the name of the buffer to display.
     :param default_char: :class:`.Char` instance to use to fill the background. This is
         transparent by default.
+    :param focus_on_click: Focus this buffer when it's click, but not yet focussed.
     """
     def __init__(self,
                  buffer_name=DEFAULT_BUFFER,
                  input_processors=None,
+                 highlighters=None,
                  lexer=None,
                  preview_search=False,
+                 search_buffer_name=SEARCH_BUFFER,
+                 get_search_state=None,
                  wrap_lines=True,
                  menu_position=None,
-                 default_char=None):
+                 default_char=None,
+                 focus_on_click=False):
         assert input_processors is None or all(isinstance(i, Processor) for i in input_processors)
+        assert highlighters is None or all(isinstance(i, Highlighter) for i in highlighters)
         assert menu_position is None or callable(menu_position)
         assert lexer is None or isinstance(lexer, Lexer)
+        assert get_search_state is None or callable(get_search_state)
 
         self.preview_search = to_cli_filter(preview_search)
+        self.get_search_state = get_search_state
         self.wrap_lines = to_cli_filter(wrap_lines)
+        self.focus_on_click = to_cli_filter(focus_on_click)
 
         self.input_processors = input_processors or []
+        self.highlighters = highlighters or []
         self.buffer_name = buffer_name
         self.menu_position = menu_position
         self.lexer = lexer or SimpleLexer()
         self.default_char = default_char or Char(token=Token.Transparent)
+        self.search_buffer_name = search_buffer_name
 
         #: LRU cache for the lexer.
         #: Often, due to cursor movement, undo/redo and window resizing
@@ -333,6 +355,11 @@ class BufferControl(UIControl):
         #: through the screen, or when we change another buffer, we don't want
         #: to recreate the same screen again.)
         self._screen_lru_cache = SimpleLRUCache(maxsize=8)
+
+        #: Highlight Cache.
+        #: When nothing of the buffer content or processors has changed, but
+        #: the highlighting of the selection/search changes,
+        self._highlight_lru_cache = SimpleLRUCache(maxsize=8)
 
         self._xy_to_cursor_position = None
         self._last_click_timestamp = None
@@ -359,7 +386,7 @@ class BufferControl(UIControl):
     def preferred_height(self, cli, width):
         # Draw content on a screen using this width. Measure the height of the
         # result.
-        screen = self.create_screen(cli, width, None)
+        screen, highlighters = self.create_screen(cli, width, None)
         return screen.height
 
     def _get_input_tokens(self, cli, document):
@@ -432,13 +459,18 @@ class BufferControl(UIControl):
         def preview_now():
             """ True when we should preview a search. """
             return bool(self.preview_search(cli) and
-                        cli.is_searching and cli.current_buffer.text)
+                        cli.buffers[self.search_buffer_name].text)
 
         if preview_now():
+            if self.get_search_state:
+                ss = self.get_search_state(cli)
+            else:
+                ss = cli.search_state
+
             document = buffer.document_for_search(SearchState(
                 text=cli.current_buffer.text,
-                direction=cli.search_state.direction,
-                ignore_case=cli.search_state.ignore_case))
+                direction=ss.direction,
+                ignore_case=ss.ignore_case))
         else:
             document = buffer.document
 
@@ -454,7 +486,10 @@ class BufferControl(UIControl):
             input_tokens, source_to_display, display_to_source = self._get_input_tokens(cli, document)
             input_tokens += [(self.default_char.token, ' ')]
 
-            indexes_to_pos = screen.write_data(input_tokens, width=wrap_width)
+            write_data_result = screen.write_data(input_tokens, width=wrap_width)
+            indexes_to_pos = write_data_result.indexes_to_pos
+            line_lengths = write_data_result.line_lengths
+
             pos_to_indexes = dict((v, k) for k, v in indexes_to_pos.items())
 
             def cursor_position_to_xy(cursor_position):
@@ -492,7 +527,7 @@ class BufferControl(UIControl):
                 # Transform.
                 return display_to_source(index)
 
-            return screen, cursor_position_to_xy, xy_to_cursor_position
+            return screen, cursor_position_to_xy, xy_to_cursor_position, line_lengths
 
         # Build a key for the caching. If any of these parameters changes, we
         # have to recreate a new screen.
@@ -509,7 +544,8 @@ class BufferControl(UIControl):
         )
 
         # Get from cache, or create if this doesn't exist yet.
-        screen, cursor_position_to_xy, self._xy_to_cursor_position = self._screen_lru_cache.get(key, _create_screen)
+        screen, cursor_position_to_xy, self._xy_to_cursor_position, line_lengths = \
+            self._screen_lru_cache.get(key, _create_screen)
 
         x, y = cursor_position_to_xy(document.cursor_position)
         screen.cursor_position = Point(y=y, x=x)
@@ -536,7 +572,63 @@ class BufferControl(UIControl):
             else:
                 screen.menu_position = None
 
-        return screen
+        # Add highlighting.
+        highlight_key = (
+            key,  # Includes everything from the 'key' above. (E.g. when the
+                     # document changes, we have to recalculate highlighting.)
+
+            # Include invalidation_hashes from all highlighters.
+            tuple(h.invalidation_hash(cli, document) for h in self.highlighters)
+        )
+
+        highlighting = self._highlight_lru_cache.get(highlight_key, lambda:
+            self._get_highlighting(cli, document, cursor_position_to_xy, line_lengths))
+
+        return screen, highlighting
+
+    def _get_highlighting(self, cli, document, cursor_position_to_xy, line_lengths):
+        """
+        Return a _HighlightDict for the highlighting. (This is a lazy dict of dicts.)
+
+        The Window class will apply this for the visible regions. - That way,
+        we don't have to recalculate the screen again for each selection/search
+        change.
+
+        :param line_lengths: Maps line numbers to the length of these lines.
+        """
+        def get_row_size(y):
+            " Return the max 'x' value for a given row in the screen. "
+            return max(1, line_lengths.get(y, 0))
+
+        # Get list of fragments.
+        row_to_fragments = defaultdict(list)
+
+        for h in self.highlighters:
+            for fragment in h.get_fragments(cli, document):
+                # Expand fragments.
+                start_column, start_row = cursor_position_to_xy(fragment.start)
+                end_column, end_row = cursor_position_to_xy(fragment.end)
+                token = fragment.token
+
+                if start_row == end_row:
+                    # Single line highlighting.
+                    row_to_fragments[start_row].append(
+                        _HighlightFragment(start_column, end_column, token))
+                else:
+                    # Multi line highlighting.
+                    # (First line.)
+                    row_to_fragments[start_row].append(
+                        _HighlightFragment(start_column, get_row_size(start_row), token))
+
+                    # (Middle lines.)
+                    for y in range(start_row + 1, end_row):
+                        row_to_fragments[y].append(_HighlightFragment(0, get_row_size(y), token))
+
+                    # (Last line.)
+                    row_to_fragments[end_row].append(_HighlightFragment(0, end_column, token))
+
+        # Create dict to return.
+        return _HighlightDict(row_to_fragments)
 
     def mouse_handler(self, cli, mouse_event):
         """
@@ -545,40 +637,52 @@ class BufferControl(UIControl):
         buffer = self._buffer(cli)
         position = mouse_event.position
 
-        if self._xy_to_cursor_position:
-            # Translate coordinates back to the cursor position of the
-            # original input.
-            pos = self._xy_to_cursor_position(position.x, position.y)
+        # Focus buffer when clicked.
+        if self.has_focus(cli):
+            if self._xy_to_cursor_position:
+                # Translate coordinates back to the cursor position of the
+                # original input.
+                pos = self._xy_to_cursor_position(position.x, position.y)
 
-            # Set the cursor position.
-            if pos <= len(buffer.text):
-                if mouse_event.event_type == MouseEventTypes.MOUSE_DOWN:
-                    buffer.exit_selection()
-                    buffer.cursor_position = pos
-
-                elif mouse_event.event_type == MouseEventTypes.MOUSE_UP:
-                    # When the cursor was moved to another place, select the text.
-                    # (The >1 is actually a small but acceptable workaround for
-                    # selecting text in Vi navigation mode. In navigation mode,
-                    # the cursor can never be after the text, so the cursor
-                    # will be repositioned automatically.)
-                    if abs(buffer.cursor_position - pos) > 1:
-                        buffer.start_selection(selection_type=SelectionType.CHARACTERS)
+                # Set the cursor position.
+                if pos <= len(buffer.text):
+                    if mouse_event.event_type == MouseEventTypes.MOUSE_DOWN:
+                        buffer.exit_selection()
                         buffer.cursor_position = pos
 
-                    # Select word around cursor on double click.
-                    # Two MOUSE_UP events in a short timespan are considered a double click.
-                    double_click = self._last_click_timestamp and time.time() - self._last_click_timestamp < .3
-                    self._last_click_timestamp = time.time()
+                    elif mouse_event.event_type == MouseEventTypes.MOUSE_UP:
+                        # When the cursor was moved to another place, select the text.
+                        # (The >1 is actually a small but acceptable workaround for
+                        # selecting text in Vi navigation mode. In navigation mode,
+                        # the cursor can never be after the text, so the cursor
+                        # will be repositioned automatically.)
+                        if abs(buffer.cursor_position - pos) > 1:
+                            buffer.start_selection(selection_type=SelectionType.CHARACTERS)
+                            buffer.cursor_position = pos
 
-                    if double_click:
-                        start, end = buffer.document.find_boundaries_of_current_word()
-                        buffer.cursor_position += start
-                        buffer.start_selection(selection_type=SelectionType.CHARACTERS)
-                        buffer.cursor_position += end - start
-                else:
-                    # Don't handle scroll events here.
-                    return NotImplemented
+                        # Select word around cursor on double click.
+                        # Two MOUSE_UP events in a short timespan are considered a double click.
+                        double_click = self._last_click_timestamp and time.time() - self._last_click_timestamp < .3
+                        self._last_click_timestamp = time.time()
+
+                        if double_click:
+                            start, end = buffer.document.find_boundaries_of_current_word()
+                            buffer.cursor_position += start
+                            buffer.start_selection(selection_type=SelectionType.CHARACTERS)
+                            buffer.cursor_position += end - start
+                    else:
+                        # Don't handle scroll events here.
+                        return NotImplemented
+
+        # Not focussed, but focussing on click events.
+        else:
+            if self.focus_on_click(cli) and mouse_event.event_type == MouseEventTypes.MOUSE_UP:
+                # Focus happens on mouseup. (If we did this on mousedown, the
+                # up event will be received at the point where this widget is
+                # focussed and be handled anyway.)
+                cli.focus_stack.replace(self.buffer_name)
+            else:
+                return NotImplemented
 
     def move_cursor_down(self, cli):
         b = self._buffer(cli)
@@ -587,3 +691,41 @@ class BufferControl(UIControl):
     def move_cursor_up(self, cli):
         b = self._buffer(cli)
         b.cursor_position += b.document.get_cursor_up_position()
+
+
+_HighlightFragment = namedtuple('_HighlightFragment', 'start_column end_column token')  # End is excluded.
+
+
+class _HighlightDict(dict):
+    """
+    Helper class to contain the highlighting.
+    Maps 'y' coordinate to 'x' coordinate to Token.
+
+    :param row_to_fragments: Dictionary that maps row numbers to list of `_HighlightFragment`.
+    """
+    def __init__(self, row_to_fragments):
+        self.row_to_fragments = row_to_fragments
+
+    def __missing__(self, key):
+        result = _HighlightDictRow(self.row_to_fragments[key])
+        self[key] = result
+        return result
+
+    def __repr__(self):
+        return '_HighlightDict(%r)' % (dict.__repr__(self), )
+
+
+class _HighlightDictRow(dict):
+    def __init__(self, list_of_fragments):
+        self.list_of_fragments = list_of_fragments
+
+    def __missing__(self, key):
+        result = None
+
+        for f in self.list_of_fragments:
+            if f.start_column <= key < f.end_column:  # End is excluded.
+                result = f.token
+                break
+
+        self[key] = result
+        return result

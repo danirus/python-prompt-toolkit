@@ -4,17 +4,18 @@ Container for the layout.
 """
 from __future__ import unicode_literals
 
-from six import with_metaclass
 from abc import ABCMeta, abstractmethod
+from collections import defaultdict
 from pygments.token import Token
+from six import with_metaclass
 
-from .screen import Point, WritePosition
+from .screen import Point, WritePosition, Char
 from .dimension import LayoutDimension, sum_layout_dimensions, max_layout_dimensions
 from .controls import UIControl, TokenListControl
 from .margins import Margin
 from prompt_toolkit.filters import to_cli_filter
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventTypes
-from prompt_toolkit.utils import SimpleLRUCache
+from prompt_toolkit.utils import SimpleLRUCache, take_using_weights
 
 __all__ = (
     'Container',
@@ -71,10 +72,11 @@ class Container(with_metaclass(ABCMeta, object)):
         """
 
     @abstractmethod
-    def walk(self):
+    def walk(self, cli):
         """
         Walk through all the layout nodes (and their children) and yield them.
         """
+
 
 def _window_too_small():
     " Create a `Window` that displays the 'Window too small' text. "
@@ -90,13 +92,26 @@ class HSplit(Container):
     :param window_too_small: A :class:`.Container` object that is displayed if
         there is not enough space for all the children. By default, this is a
         "Window too small" message.
+    :param get_dimensions: (`None` or a callable that takes a
+        `CommandLineInterface` and returns a list of `LayoutDimension`
+        instances.) By default the dimensions are taken from the children and
+        divided by the available space. However, when `get_dimensions` is specified,
+        this is taken instead.
+    :param report_dimensions_callback: When rendering, this function is called
+        with the `CommandLineInterface` and the list of used dimensions. (As a
+        list of integers.)
     """
-    def __init__(self, children, window_too_small=None):
+    def __init__(self, children, window_too_small=None,
+                 get_dimensions=None, report_dimensions_callback=None):
         assert all(isinstance(c, Container) for c in children)
         assert window_too_small is None or isinstance(window_too_small, Container)
+        assert get_dimensions is None or callable(get_dimensions)
+        assert report_dimensions_callback is None or callable(report_dimensions_callback)
 
         self.children = children
         self.window_too_small = window_too_small or _window_too_small()
+        self.get_dimensions = get_dimensions
+        self.report_dimensions_callback = report_dimensions_callback
 
     def preferred_width(self, cli, max_available_width):
         if self.children:
@@ -120,49 +135,81 @@ class HSplit(Container):
         :param screen: The :class:`~prompt_toolkit.layout.screen.Screen` class
             to which the output has to be written.
         """
+        sizes = self._divide_heigths(cli, write_position)
+
+        if self.report_dimensions_callback:
+            self.report_dimensions_callback(cli, sizes)
+
+        if sizes is None:
+            self.window_too_small.write_to_screen(
+                cli, screen, mouse_handlers, write_position)
+        else:
+            # Draw child panes.
+            ypos = write_position.ypos
+            xpos = write_position.xpos
+            width = write_position.width
+
+            for s, c in zip(sizes, self.children):
+                c.write_to_screen(cli, screen, mouse_handlers, WritePosition(xpos, ypos, width, s))
+                ypos += s
+
+    def _divide_heigths(self, cli, write_position):
+        """
+        Return the heights for all rows.
+        Or None when there is not enough space.
+        """
+        if not self.children:
+            return []
+
         # Calculate heights.
-        dimensions = [c.preferred_height(cli, write_position.width) for c in self.children]
+        given_dimensions = self.get_dimensions(cli) if self.get_dimensions else None
+
+        def get_dimension_for_child(c, index):
+            if given_dimensions and given_dimensions[index] is not None:
+                return given_dimensions[index]
+            else:
+                return c.preferred_height(cli, write_position.width)
+
+        dimensions = [get_dimension_for_child(c, index) for index, c in enumerate(self.children)]
+
+        # Sum dimensions
         sum_dimensions = sum_layout_dimensions(dimensions)
 
         # If there is not enough space for both.
         # Don't do anything.
         if sum_dimensions.min > write_position.extended_height:
-            self.window_too_small.write_to_screen(
-                cli, screen, mouse_handlers, write_position)
             return
 
         # Find optimal sizes. (Start with minimal size, increase until we cover
         # the whole height.)
         sizes = [d.min for d in dimensions]
 
-        i = 0
+        child_generator = take_using_weights(
+            items=list(range(len(dimensions))),
+            weights=[d.weight for d in dimensions])
+
+        i = next(child_generator)
+
         while sum(sizes) < min(write_position.extended_height, sum_dimensions.preferred):
             # Increase until we meet at least the 'preferred' size.
             if sizes[i] < dimensions[i].preferred:
                 sizes[i] += 1
-            i = (i + 1) % len(sizes)
+            i = next(child_generator)
 
         if not any([cli.is_returning, cli.is_exiting, cli.is_aborting]):
             while sum(sizes) < min(write_position.height, sum_dimensions.max):
                 # Increase until we use all the available space. (or until "max")
                 if sizes[i] < dimensions[i].max:
                     sizes[i] += 1
-                i = (i + 1) % len(sizes)
+                i = next(child_generator)
 
-        # Draw child panes.
-        ypos = write_position.ypos
-        xpos = write_position.xpos
-        width = write_position.width
+        return sizes
 
-        for s, c in zip(sizes, self.children):
-            c.write_to_screen(cli, screen, mouse_handlers, WritePosition(xpos, ypos, width, s))
-            ypos += s
-
-    def walk(self):
+    def walk(self, cli):
         """ Walk through children. """
         yield self
         for c in self.children:
-            for i in c.walk():
+            for i in c.walk(cli):
                 yield i
 
 
@@ -174,13 +221,26 @@ class VSplit(Container):
     :param window_too_small: A :class:`.Container` object that is displayed if
         there is not enough space for all the children. By default, this is a
         "Window too small" message.
+    :param get_dimensions: (`None` or a callable that takes a
+        `CommandLineInterface` and returns a list of `LayoutDimension`
+        instances.) By default the dimensions are taken from the children and
+        divided by the available space. However, when `get_dimensions` is specified,
+        this is taken instead.
+    :param report_dimensions_callback: When rendering, this function is called
+        with the `CommandLineInterface` and the list of used dimensions. (As a
+        list of integers.)
     """
-    def __init__(self, children, window_too_small=None):
+    def __init__(self, children, window_too_small=None,
+                 get_dimensions=None, report_dimensions_callback=None):
         assert all(isinstance(c, Container) for c in children)
         assert window_too_small is None or isinstance(window_too_small, Container)
+        assert get_dimensions is None or callable(get_dimensions)
+        assert report_dimensions_callback is None or callable(report_dimensions_callback)
 
         self.children = children
         self.window_too_small = window_too_small or _window_too_small()
+        self.get_dimensions = get_dimensions
+        self.report_dimensions_callback = report_dimensions_callback
 
     def preferred_width(self, cli, max_available_width):
         dimensions = [c.preferred_width(cli, max_available_width) for c in self.children]
@@ -204,8 +264,21 @@ class VSplit(Container):
         Return the widths for all columns.
         Or None when there is not enough space.
         """
+        if not self.children:
+            return []
+
         # Calculate widths.
-        dimensions = [c.preferred_width(cli, width) for c in self.children]
+        given_dimensions = self.get_dimensions(cli) if self.get_dimensions else None
+
+        def get_dimension_for_child(c, index):
+            if given_dimensions and given_dimensions[index] is not None:
+                return given_dimensions[index]
+            else:
+                return c.preferred_width(cli, width)
+
+        dimensions = [get_dimension_for_child(c, index) for index, c in enumerate(self.children)]
+
+        # Sum dimensions
         sum_dimensions = sum_layout_dimensions(dimensions)
 
         # If there is not enough space for both.
@@ -213,16 +286,27 @@ class VSplit(Container):
         if sum_dimensions.min > width:
             return
 
-        # TODO: like HSplit, first increase until the "preferred" size.
-
         # Find optimal sizes. (Start with minimal size, increase until we cover
         # the whole height.)
         sizes = [d.min for d in dimensions]
-        i = 0
+
+        child_generator = take_using_weights(
+            items=list(range(len(dimensions))),
+            weights=[d.weight for d in dimensions])
+
+        i = next(child_generator)
+
+        while sum(sizes) < min(width, sum_dimensions.preferred):
+            # Increase until we meet at least the 'preferred' size.
+            if sizes[i] < dimensions[i].preferred:
+                sizes[i] += 1
+            i = next(child_generator)
+
         while sum(sizes) < min(width, sum_dimensions.max):
+            # Increase until we use all the available space.
             if sizes[i] < dimensions[i].max:
                 sizes[i] += 1
-            i = (i + 1) % len(sizes)
+            i = next(child_generator)
 
         return sizes
 
@@ -237,6 +321,9 @@ class VSplit(Container):
             return
 
         sizes = self._divide_widths(cli, write_position.width)
+
+        if self.report_dimensions_callback:
+            self.report_dimensions_callback(cli, sizes)
 
         # If there is not enough space.
         if sizes is None:
@@ -257,11 +344,11 @@ class VSplit(Container):
             c.write_to_screen(cli, screen, mouse_handlers, WritePosition(xpos, ypos, s, height))
             xpos += s
 
-    def walk(self):
+    def walk(self, cli):
         """ Walk through children. """
         yield self
         for c in self.children:
-            for i in c.walk():
+            for i in c.walk(cli):
                 yield i
 
 
@@ -306,14 +393,16 @@ class FloatContainer(Container):
     def write_to_screen(self, cli, screen, mouse_handlers, write_position):
         self.content.write_to_screen(cli, screen, mouse_handlers, write_position)
 
-        # When a menu_position was given, use this instead of the cursor
-        # position. (These cursor positions are absolute, translate again
-        # relative to the write_position.)
-        cursor_position = screen.menu_position or screen.cursor_position
-        cursor_position = Point(x=cursor_position.x - write_position.xpos,
-                                y=cursor_position.y - write_position.ypos)
-
         for fl in self.floats:
+            # When a menu_position was given, use this instead of the cursor
+            # position. (These cursor positions are absolute, translate again
+            # relative to the write_position.)
+            # Note: This should be inside the for-loop, because one float could
+            #       set the cursor position to be used for the next one.
+            cursor_position = screen.menu_position or screen.cursor_position
+            cursor_position = Point(x=cursor_position.x - write_position.xpos,
+                                    y=cursor_position.y - write_position.ypos)
+
             fl_width = fl.get_width(cli)
             fl_height = fl.get_height(cli)
 
@@ -414,15 +503,15 @@ class FloatContainer(Container):
                                    width=width, height=height)
                 fl.content.write_to_screen(cli, screen, mouse_handlers, wp)
 
-    def walk(self):
+    def walk(self, cli):
         """ Walk through children. """
         yield self
 
-        for i in self.content.walk():
+        for i in self.content.walk(cli):
             yield i
 
         for f in self.floats:
-            for i in f.content.walk():
+            for i in f.content.walk(cli):
                 yield i
 
 
@@ -570,8 +659,8 @@ class WindowRenderInfo(object):
         """
         return (self.first_visible_line(after_scroll_offset) +
                 (self.last_visible_line(before_scroll_offset) -
-                    self.first_visible_line(after_scroll_offset))/2
-                )
+                 self.first_visible_line(after_scroll_offset)) / 2
+               )
 
     @property
     def content_height(self):
@@ -616,7 +705,7 @@ class ScrollOffsets(object):
     """
     Scroll offsets for the :class:`.Window` class.
 
-    Note that left/rigth offsets only make sense if line wrapping is disabled.
+    Note that left/right offsets only make sense if line wrapping is disabled.
     """
     def __init__(self, top=0, bottom=0, left=0, right=0):
         self.top = top
@@ -726,7 +815,7 @@ class Window(Container):
 
         # Window of the content.
         preferred_width = self.content.preferred_width(
-                cli, max_available_width - total_margin_width)
+            cli, max_available_width - total_margin_width)
 
         if preferred_width is not None:
             preferred_width += total_margin_width
@@ -752,7 +841,7 @@ class Window(Container):
         """
         dimension = dimension or LayoutDimension()
 
-        # When a preferred dimension was explicitely given to the Window,
+        # When a preferred dimension was explicitly given to the Window,
         # ignore the UIControl.
         if dimension.preferred_specified:
             preferred = dimension.preferred
@@ -767,7 +856,7 @@ class Window(Container):
                 preferred = max(preferred, dimension.min)
 
         # When a `dont_extend` flag has been given, use the preferred dimension
-        # also as the max demension.
+        # also as the max dimension.
         if dont_extend and preferred is not None:
             max_ = min(dimension.max, preferred)
         else:
@@ -780,21 +869,26 @@ class Window(Container):
         Write window to screen. This renders the user control, the margins and
         copies everything over to the absolute position at the given screen.
         """
-        # Render margins.
+        # Calculate margin sizes.
         left_margin_widths = [m.get_width(cli) for m in self.left_margins]
         right_margin_widths = [m.get_width(cli) for m in self.right_margins]
         total_margin_width = sum(left_margin_widths + right_margin_widths)
 
         # Render UserControl.
-        temp_screen = self.content.create_screen(
+        tpl = self.content.create_screen(
             cli, write_position.width - total_margin_width, write_position.height)
+        if isinstance(tpl, tuple):
+            temp_screen, highlighting = tpl
+        else:
+            # For backwards, compatibility.
+            temp_screen, highlighting = tpl, defaultdict(lambda: defaultdict(lambda: None))
 
         # Scroll content.
         applied_scroll_offsets = self._scroll(
             temp_screen, write_position.width - total_margin_width, write_position.height, cli)
 
         # Write body to screen.
-        self._copy_body(cli, temp_screen, screen, write_position,
+        self._copy_body(cli, temp_screen, highlighting, screen, write_position,
                         sum(left_margin_widths), write_position.width - total_margin_width,
                         applied_scroll_offsets)
 
@@ -830,17 +924,17 @@ class Window(Container):
             return result
 
         mouse_handlers.set_mouse_handler_for_range(
-                x_min=write_position.xpos + sum(left_margin_widths),
-                x_max=write_position.xpos + write_position.width - total_margin_width,
-                y_min=write_position.ypos,
-                y_max=write_position.ypos + write_position.height,
-                handler=mouse_handler)
+            x_min=write_position.xpos + sum(left_margin_widths),
+            x_max=write_position.xpos + write_position.width - total_margin_width,
+            y_min=write_position.ypos,
+            y_max=write_position.ypos + write_position.height,
+            handler=mouse_handler)
 
         # Render and copy margins.
         move_x = 0
 
         def render_margin(m, width):
-            " Render margin. return `Screen`. "
+            " Render margin. Return `Screen`. "
             # Retrieve margin tokens.
             tokens = m.create_margin(cli, self.render_info, width, write_position.height)
 
@@ -871,7 +965,8 @@ class Window(Container):
             self._copy_margin(margin_screen, screen, write_position, move_x, width)
             move_x += width
 
-    def _copy_body(self, cli, temp_screen, new_screen, write_position, move_x, width, applied_scroll_offsets):
+    def _copy_body(self, cli, temp_screen, highlighting, new_screen,
+                   write_position, move_x, width, applied_scroll_offsets):
         """
         Copy characters from the temp screen that we got from the `UIControl`
         to the real screen.
@@ -883,6 +978,9 @@ class Window(Container):
         temp_buffer = temp_screen.data_buffer
         new_buffer = new_screen.data_buffer
         temp_screen_height = temp_screen.height
+
+        vertical_scroll = self.vertical_scroll
+        horizontal_scroll = self.horizontal_scroll
         y = 0
 
         # Now copy the region we need to the real screen.
@@ -897,25 +995,31 @@ class Window(Container):
                 # screen's height.)
                 break
             else:
-                temp_row = temp_buffer[y + self.vertical_scroll]
+                temp_row = temp_buffer[y + vertical_scroll]
+                highlighting_row = highlighting[y + vertical_scroll]
 
                 # Copy row content, except for transparent tokens.
                 # (This is useful in case of floats.)
+                # Also apply highlighting.
                 for x in range(0, width):
-                    cell = temp_row[x + self.horizontal_scroll]
-                    if cell.token != Transparent:
+                    cell = temp_row[x + horizontal_scroll]
+                    highlighting_token = highlighting_row[x]
+
+                    if highlighting_token:
+                        new_row[x + xpos] = Char(cell.char, highlighting_token)
+                    elif cell.token != Transparent:
                         new_row[x + xpos] = cell
 
         if self.content.has_focus(cli):
-            new_screen.cursor_position = Point(y=temp_screen.cursor_position.y + ypos - self.vertical_scroll,
-                                               x=temp_screen.cursor_position.x + xpos - self.horizontal_scroll)
+            new_screen.cursor_position = Point(y=temp_screen.cursor_position.y + ypos - vertical_scroll,
+                                               x=temp_screen.cursor_position.x + xpos - horizontal_scroll)
 
             if not self.always_hide_cursor(cli):
                 new_screen.show_cursor = temp_screen.show_cursor
 
         if not new_screen.menu_position and temp_screen.menu_position:
-            new_screen.menu_position = Point(y=temp_screen.menu_position.y + ypos - self.vertical_scroll,
-                                             x=temp_screen.menu_position.x + xpos - self.horizontal_scroll)
+            new_screen.menu_position = Point(y=temp_screen.menu_position.y + ypos - vertical_scroll,
+                                             x=temp_screen.menu_position.x + xpos - horizontal_scroll)
 
         # Update height of the output screen. (new_screen.write_data is not
         # called, so the screen is not aware of its height.)
@@ -949,14 +1053,15 @@ class Window(Container):
         requested scroll offset.
         Return the applied scroll offsets.
         """
-        def do_scroll(current_scroll, scroll_offset_start, scroll_offset_end, cursor_pos, window_size, content_size):
+        def do_scroll(current_scroll, scroll_offset_start, scroll_offset_end,
+                      cursor_pos, window_size, content_size):
             " Scrolling algorithm. Used for both horizontal and vertical scrolling. "
             # Calculate the scroll offset to apply.
             # This can obviously never be more than have the screen size. Also, when the
             # cursor appears at the top or bottom, we don't apply the offset.
             scroll_offset_start = int(min(scroll_offset_start, window_size / 2, cursor_pos))
             scroll_offset_end = int(min(scroll_offset_end, window_size / 2,
-                                           content_size - 1 - cursor_pos))
+                                        content_size - 1 - cursor_pos))
 
             # Prevent negative scroll offsets.
             if current_scroll < 0:
@@ -993,7 +1098,7 @@ class Window(Container):
         # remains visible.
         offsets = self.scroll_offsets
 
-        self.vertical_scroll, scroll_offset_top, scroll_offset_bottom  = do_scroll(
+        self.vertical_scroll, scroll_offset_top, scroll_offset_bottom = do_scroll(
             current_scroll=self.vertical_scroll,
             scroll_offset_start=offsets.top,
             scroll_offset_end=offsets.bottom,
@@ -1047,7 +1152,7 @@ class Window(Container):
 
             self.vertical_scroll -= 1
 
-    def walk(self):
+    def walk(self, cli):
         # Only yield self. A window doesn't have children.
         yield self
 
@@ -1086,8 +1191,8 @@ class ConditionalContainer(Container):
         if self.filter(cli):
             return self.content.write_to_screen(cli, screen, mouse_handlers, write_position)
 
-    def walk(self):
-        return self.content.walk()
+    def walk(self, cli):
+        return self.content.walk(cli)
 
 
 # Deprecated alias for 'Container'.
