@@ -7,6 +7,7 @@ from prompt_toolkit.renderer import Output
 from prompt_toolkit.styles import ANSI_COLOR_NAMES
 from prompt_toolkit.win32_types import CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE, STD_INPUT_HANDLE, COORD, SMALL_RECT
 
+import os
 import six
 
 __all__ = (
@@ -39,6 +40,26 @@ _DEBUG_RENDER_OUTPUT = False
 _DEBUG_RENDER_OUTPUT_FILENAME = r'prompt-toolkit-windows-output.log'
 
 
+class NoConsoleScreenBufferError(Exception):
+    """
+    Raised when the application is not running inside a Windows Console, but
+    the user tries to instantiate Win32Output.
+    """
+    def __init__(self):
+        # Are we running in 'xterm' on Windows, like git-bash for instance?
+        xterm = 'xterm' in os.environ.get('TERM', '')
+
+        if xterm:
+            message = ('Found %s, while expecting a Windows console. '
+                       'Maybe try to run this program using "winpty" '
+                       'or run it in cmd.exe instead. Or otherwise, '
+                       'in case of Cygwin, use the Python executable '
+                       'that is compiled for Cygwin.' % os.environ['TERM'])
+        else:
+            message = 'No Windows console found. Are you running cmd.exe?'
+        super(NoConsoleScreenBufferError, self).__init__(message)
+
+
 class Win32Output(Output):
     """
     I/O abstraction for rendering to Windows consoles.
@@ -55,8 +76,20 @@ class Win32Output(Output):
 
         self.color_lookup_table = ColorLookupTable()
 
+        # Remember the default console colors.
+        info = self.get_win32_screen_buffer_info()
+        self.default_attrs = info.wAttributes if info else 15
+
         if _DEBUG_RENDER_OUTPUT:
             self.LOG = open(_DEBUG_RENDER_OUTPUT_FILENAME, 'ab')
+
+    def fileno(self):
+        " Return file descriptor. "
+        return self.stdout.fileno()
+
+    def encoding(self):
+        " Return encoding used for stdout. "
+        return self.stdout.encoding
 
     def write(self, data):
         self._buffer.append(data)
@@ -108,11 +141,35 @@ class Win32Output(Output):
         """
         Return Screen buffer info.
         """
+        # NOTE: We don't call the `GetConsoleScreenBufferInfo` API through
+        #     `self._winapi`. Doing so causes Python to crash on certain 64bit
+        #     Python versions. (Reproduced with 64bit Python 2.7.6, on Windows
+        #     10). It is not clear why. Possibly, it has to do with passing
+        #     these objects as an argument, or through *args.
+
+        # The Python documentation contains the following - possibly related - warning:
+        #     ctypes does not support passing unions or structures with
+        #     bit-fields to functions by value. While this may work on 32-bit
+        #     x86, it's not guaranteed by the library to work in the general
+        #     case. Unions and structures with bit-fields should always be
+        #     passed to functions by pointer.
+
+        # Also see:
+        #    - https://github.com/ipython/ipython/issues/10070
+        #    - https://github.com/jonathanslenders/python-prompt-toolkit/issues/406
+        #    - https://github.com/jonathanslenders/python-prompt-toolkit/issues/86
+
+        self.flush()
         sbinfo = CONSOLE_SCREEN_BUFFER_INFO()
-        success = self._winapi(windll.kernel32.GetConsoleScreenBufferInfo,
-                               self.hconsole, byref(sbinfo))
+        success = windll.kernel32.GetConsoleScreenBufferInfo(self.hconsole, byref(sbinfo))
+
+        # success = self._winapi(windll.kernel32.GetConsoleScreenBufferInfo,
+        #                        self.hconsole, byref(sbinfo))
+
         if success:
             return sbinfo
+        else:
+            raise NoConsoleScreenBufferError
 
     def set_title(self, title):
         """
@@ -164,16 +221,31 @@ class Win32Output(Output):
                      byref(chars_written))
 
     def reset_attributes(self):
-        self._winapi(windll.kernel32.SetConsoleTextAttribute, self.hconsole, 15)  # White
+        " Reset the console foreground/background color. "
+        self._winapi(windll.kernel32.SetConsoleTextAttribute, self.hconsole,
+                     self.default_attrs)
 
     def set_attributes(self, attrs):
         fgcolor, bgcolor, bold, underline, italic, blink, reverse = attrs
 
-        if reverse:
-            fgcolor, bgcolor = bgcolor, fgcolor
+        # Start from the default attributes.
+        attrs = self.default_attrs
 
-        i = self.color_lookup_table.lookup_color(fgcolor, bgcolor)
-        self._winapi(windll.kernel32.SetConsoleTextAttribute, self.hconsole, i)
+        # Override the last four bits: foreground color.
+        if fgcolor is not None:
+            attrs = attrs & ~0xf
+            attrs |= self.color_lookup_table.lookup_fg_color(fgcolor)
+
+        # Override the next four bits: background color.
+        if bgcolor is not None:
+            attrs = attrs & ~0xf0
+            attrs |= self.color_lookup_table.lookup_bg_color(bgcolor)
+
+        # Reverse: swap these four bits groups.
+        if reverse:
+            attrs = (attrs & ~0xff) | ((attrs & 0xf) << 4) | ((attrs & 0xf0) >> 4)
+
+        self._winapi(windll.kernel32.SetConsoleTextAttribute, self.hconsole, attrs)
 
     def disable_autowrap(self):
         # Not supported by Windows.
@@ -255,7 +327,11 @@ class Win32Output(Output):
 
         # Scroll vertical
         win_height = sr.Bottom - sr.Top
-        result.Bottom = max(win_height, cursor_pos.Y)
+        if 0 < sr.Bottom - cursor_pos.Y < win_height - 1:
+            # no vertical scroll if cursor already on the screen
+            result.Bottom = sr.Bottom
+        else:
+            result.Bottom = max(win_height, cursor_pos.Y)
         result.Top = result.Bottom - win_height
 
         # Scroll API
@@ -353,28 +429,27 @@ class BACKROUND_COLOR:
 def _create_ansi_color_dict(color_cls):
     " Create a table that maps the 16 named ansi colors to their Windows code. "
     return {
-        'black':   color_cls.BLACK,
-        'default': color_cls.BLACK,
-        'white':   color_cls.GRAY | color_cls.INTENSITY,
-
+        'ansidefault':   color_cls.BLACK,
+        'ansiblack':     color_cls.BLACK,
+        'ansidarkgray':  color_cls.BLACK | color_cls.INTENSITY,
+        'ansilightgray': color_cls.GRAY,
+        'ansiwhite':     color_cls.GRAY | color_cls.INTENSITY,
+        
         # Low intensity.
-        'red':     color_cls.RED,
-        'green':   color_cls.GREEN,
-        'yellow':  color_cls.YELLOW,
-        'blue':    color_cls.BLUE,
-        'magenta': color_cls.MAGENTA,
-        'cyan':    color_cls.CYAN,
-        'gray':    color_cls.GRAY,
-
+        'ansidarkred':     color_cls.RED,
+        'ansidarkgreen':   color_cls.GREEN,
+        'ansibrown':       color_cls.YELLOW,
+        'ansidarkblue':    color_cls.BLUE,
+        'ansipurple':      color_cls.MAGENTA,
+        'ansiteal':        color_cls.CYAN,
 
         # High intensity.
-        'dark-gray':      color_cls.BLACK | color_cls.INTENSITY,
-        'bright-red':     color_cls.RED | color_cls.INTENSITY,
-        'bright-green':   color_cls.GREEN | color_cls.INTENSITY,
-        'bright-yellow':  color_cls.YELLOW | color_cls.INTENSITY,
-        'bright-blue':    color_cls.BLUE | color_cls.INTENSITY,
-        'bright-magenta': color_cls.MAGENTA | color_cls.INTENSITY,
-        'bright-cyan':    color_cls.CYAN | color_cls.INTENSITY,
+        'ansired':        color_cls.RED | color_cls.INTENSITY,
+        'ansigreen':      color_cls.GREEN | color_cls.INTENSITY,
+        'ansiyellow':     color_cls.YELLOW | color_cls.INTENSITY,
+        'ansiblue':       color_cls.BLUE | color_cls.INTENSITY,
+        'ansifuchsia':    color_cls.MAGENTA | color_cls.INTENSITY,
+        'ansiturquoise':  color_cls.CYAN | color_cls.INTENSITY,
     }
 
 FG_ANSI_COLORS = _create_ansi_color_dict(FOREGROUND_COLOR)
@@ -417,6 +492,7 @@ class ColorLookupTable(object):
             (0xff, 0x44, 0xff, FG.MAGENTA | FG.INTENSITY, BG.MAGENTA | BG.INTENSITY),
             (0xff, 0xff, 0x44, FG.YELLOW | FG.INTENSITY, BG.YELLOW | BG.INTENSITY),
 
+            (0x44, 0x44, 0x44, FG.BLACK | FG.INTENSITY, BG.BLACK | BG.INTENSITY),
             (0xff, 0xff, 0xff, FG.GRAY | FG.INTENSITY, BG.GRAY | BG.INTENSITY),
         ]
 
@@ -453,29 +529,28 @@ class ColorLookupTable(object):
             self.best_match[color] = indexes
         return indexes
 
-    def lookup_color(self, fg_color, bg_color):
+    def lookup_fg_color(self, fg_color):
         """
         Return the color for use in the
         `windll.kernel32.SetConsoleTextAttribute` API call.
 
         :param fg_color: Foreground as text. E.g. 'ffffff' or 'red'
-        :param bg_color: Background as text. E.g. 'ffffff' or 'red'
         """
-        # Take white as the default foreground color.
-        # (otherwise many things will be invisible.)
-        if fg_color is None:
-            fg_color = 'ffffff'
-
         # Foreground.
         if fg_color in FG_ANSI_COLORS:
-            fg_index = FG_ANSI_COLORS[fg_color]
+            return FG_ANSI_COLORS[fg_color]
         else:
-            fg_index = self._color_indexes(fg_color)[0]
+            return self._color_indexes(fg_color)[0]
 
+    def lookup_bg_color(self, bg_color):
+        """
+        Return the color for use in the
+        `windll.kernel32.SetConsoleTextAttribute` API call.
+
+        :param bg_color: Background as text. E.g. 'ffffff' or 'red'
+        """
         # Background.
         if bg_color in BG_ANSI_COLORS:
-            bg_index = BG_ANSI_COLORS[bg_color]
+            return BG_ANSI_COLORS[bg_color]
         else:
-            bg_index = self._color_indexes(bg_color)[1]
-
-        return fg_index | bg_index
+            return self._color_indexes(bg_color)[1]

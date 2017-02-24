@@ -7,19 +7,19 @@ Python Prompt Toolkit
 and terminal applications in Python.
 
 Read the `documentation on readthedocs
-<http://python-prompt-toolkit.readthedocs.org/en/latest/>`_.
+<http://python-prompt-toolkit.readthedocs.io/en/stable/>`_.
 
 
 Ptpython
 ********
 
 `ptpython <http://github.com/jonathanslenders/ptpython/>`_ is an interactive
-Python Shell, build on top of prompt-toolkit.
+Python Shell, build on top of prompt_toolkit.
 
 .. image :: https://github.com/jonathanslenders/python-prompt-toolkit/raw/master/docs/images/ptpython.png
 
 
-prompt-toolkit features
+prompt_toolkit features
 ***********************
 
 ``prompt_toolkit`` could be a replacement for `GNU readline
@@ -33,17 +33,19 @@ Some features:
 - Multi-line input editing.
 - Advanced code completion.
 - Both Emacs and Vi key bindings. (Similar to readline.)
+- Even some advanced Vi functionality, like named registers and digraphs.
 - Reverse and forward incremental search.
-- Runs on all Python versions from 2.6 up to 3.4.
+- Runs on all Python versions from 2.6 up to 3.5.
 - Works well with Unicode double width characters. (Chinese input.)
 - Selecting text for copy/paste. (Both Emacs and Vi style.)
+- Support for `bracketed paste <https://cirw.in/blog/bracketed-paste>`_.
 - Mouse support for cursor positioning and scrolling.
 - Auto suggestions. (Like `fish shell <http://fishshell.com/>`_.)
 - Multiple input buffers.
 - No global state.
 - Lightweight, the only dependencies are Pygments, six and wcwidth.
-- Code written with love.
-- Runs on Linux, OS X, OpenBSD and Windows systems.
+- Runs on Linux, OS X, FreeBSD, OpenBSD and Windows systems.
+- And much more...
 
 Feel free to create tickets for bugs and feature requests, and create pull
 requests if you have nice patches that you would like to share with others.
@@ -63,7 +65,7 @@ possible". Both Unix and Windows terminals have their limitations. But in
 general, the Unix experience will still be a little better.
 
 For Windows, it's recommended to use either `cmder
-<http://gooseberrycreative.com/cmder/>`_ or `conemu <https://conemu.github.io/>`_.
+<http://cmder.net/>`_ or `conemu <https://conemu.github.io/>`_.
 
 
 Installation
@@ -71,7 +73,7 @@ Installation
 
 ::
 
-    pip install prompt-toolkit
+    pip install prompt_toolkit
 
 For Conda, do:
 
@@ -98,26 +100,40 @@ examples are chosen to demonstrate only one thing. Also, don't be afraid to
 look at the source code. The implementation of the ``prompt`` function could be
 a good start.
 
-Note: For Python 2, you need to add ``from __future__ import unicode_literals``
-to the above example. All strings are expected to be unicode strings.
+Note for Python 2: all strings are expected to be unicode strings. So, either
+put a small ``u`` in front of every string or put ``from __future__ import
+unicode_literals`` at the start of the above example.
 
 
-Projects using prompt-toolkit
+Projects using prompt_toolkit
 *****************************
+
+Shells:
 
 - `ptpython <http://github.com/jonathanslenders/ptpython/>`_: Python REPL
 - `ptpdb <http://github.com/jonathanslenders/ptpdb/>`_: Python debugger (pdb replacement)
 - `pgcli <http://pgcli.com/>`_: Postgres client.
 - `mycli <http://mycli.net>`_: MySql client.
-- `pyvim <http://github.com/jonathanslenders/pyvim/>`_: A Vim clone in pure Python
 - `wharfee <http://wharfee.com/>`_: A Docker command line.
-- `xonsh <http://xonsh.org/>`_: A Python-ish, BASHwards-compatible shell.
+- `xonsh <http://xon.sh/>`_: A Python-ish, BASHwards-compatible shell.
 - `saws <https://github.com/donnemartin/saws>`_: A Supercharged AWS Command Line Interface.
 - `cycli <https://github.com/nicolewhite/cycli>`_:  A Command Line Interface for Cypher.
 - `crash <https://github.com/crate/crash>`_:  Crate command line client.
 - `vcli <https://github.com/dbcli/vcli>`_: Vertica client.
 - `aws-shell <https://github.com/awslabs/aws-shell>`_: An integrated shell for working with the AWS CLI.
+- `softlayer-python <https://github.com/softlayer/softlayer-python>`_: A command-line interface to manage various SoftLayer products and services.
+- `ipython <http://github.com/ipython/ipython/>`_: The IPython REPL
+- `click-repl <https://github.com/click-contrib/click-repl>`_: Subcommand REPL for click apps.
+- `haxor-news <https://github.com/donnemartin/haxor-news>`_: A Hacker News CLI.
+- `gitsome <https://github.com/donnemartin/gitsome>`_: A Git/Shell Autocompleter with GitHub Integration.
+- `http-prompt <https://github.com/eliangcs/http-prompt>`_: An interactive command-line HTTP client.
+- `coconut <http://coconut-lang.org/>`_: Functional programming in Python.
+- `Ergonomica <https://ergonomica.github.io/>`_: A Bash alternative written in Python.
 
+Full screen applications:
+
+- `pymux <http://github.com/jonathanslenders/pymux/>`_: A terminal multiplexer (like tmux) in pure Python.
+- `pyvim <http://github.com/jonathanslenders/pyvim/>`_: A Vim clone in pure Python.
 
 (Want your own project to be listed here? Please create a GitHub issue.)
 
@@ -149,6 +165,6 @@ Special thanks to
 .. |Build Status| image:: https://api.travis-ci.org/jonathanslenders/python-prompt-toolkit.svg?branch=master
     :target: https://travis-ci.org/jonathanslenders/python-prompt-toolkit#
 
-.. |PyPI| image:: https://pypip.in/version/prompt-toolkit/badge.svg
+.. |PyPI| image:: https://img.shields.io/pypi/v/prompt_toolkit.svg
     :target: https://pypi.python.org/pypi/prompt-toolkit/
     :alt: Latest Version

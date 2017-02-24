@@ -23,7 +23,7 @@ class ClipboardData(object):
     """
     def __init__(self, text='', type=SelectionType.CHARACTERS):
         assert isinstance(text, six.string_types)
-        assert type in (SelectionType.CHARACTERS, SelectionType.LINES)
+        assert type in (SelectionType.CHARACTERS, SelectionType.LINES, SelectionType.BLOCK)
 
         self.text = text
         self.type = type
@@ -49,6 +49,11 @@ class Clipboard(with_metaclass(ABCMeta, object)):
         """
         assert isinstance(text, six.string_types)
         self.set_data(ClipboardData(text))
+
+    def rotate(self):
+        """
+        For Emacs mode, rotate the kill ring.
+        """
 
     @abstractmethod
     def get_data(self):

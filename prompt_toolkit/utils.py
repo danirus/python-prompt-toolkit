@@ -1,60 +1,76 @@
 from __future__ import unicode_literals
+import inspect
 import os
 import signal
 import sys
 import threading
+import weakref
 
 from wcwidth import wcwidth
+from six.moves import range
 
 
 __all__ = (
-    'Callback',
+    'Event',
     'DummyContext',
     'get_cwidth',
     'suspend_to_background_supported',
     'is_conemu_ansi',
     'is_windows',
     'in_main_thread',
-    'SimpleLRUCache',
     'take_using_weights',
+    'test_callable_args',
 )
 
 
-class Callback(object):
+class Event(object):
     """
-    Callbacks wrapper. Used for event propagation.
+    Simple event to which event handlers can be attached. For instance::
 
-    There are two ways of using it. The first way is to create a callback
-    instance from a callable and pass it to the code that's going to fire it.
-    (This can also be used as a decorator.)
-    ::
+        class Cls:
+            def __init__(self):
+                # Define event. The first parameter is the sender.
+                self.event = Event(self)
 
-        c = Callback(function)
-        c.fire()
+        obj = Cls()
 
-    The second way is that the code who's going to fire the callback, already
-    created an Callback instance. Then handlers can be attached using the
-    ``+=`` operator::
+        def handler(sender):
+            pass
 
-        c = Callback()
-        c += handler_function  # Add event handler.
-        c.fire()  # Fire event.
+        # Add event handler by using the += operator.
+        obj.event += handler
+
+        # Fire event.
+        obj.event()
     """
-    def __init__(self, func=None):
-        assert func is None or callable(func)
-        self._handlers = [func] if func else []
+    def __init__(self, sender, handler=None):
+        self.sender = sender
+        self._handlers = []
 
-    def fire(self, *args, **kwargs):
-        """
-        Trigger callback.
-        """
+        if handler is not None:
+            self += handler
+
+    def __call__(self):
+        " Fire event. "
         for handler in self._handlers:
-            handler(*args, **kwargs)
+            handler(self.sender)
+
+    def fire(self):
+        " Alias for just calling the event. "
+        self()
 
     def __iadd__(self, handler):
         """
         Add another handler to this callback.
+        (Handler should be a callable that takes exactly one parameter: the
+        sender object.)
         """
+        # Test handler.
+        assert callable(handler)
+        if not test_callable_args(handler, [None]):
+            raise TypeError("%r doesn't take exactly one argument." % handler)
+
+        # Add to list of event handlers.
         self._handlers.append(handler)
         return self
 
@@ -65,17 +81,52 @@ class Callback(object):
         self._handlers.remove(handler)
         return self
 
-    def __or__(self, other):
-        """
-        Chain two callbacks, using the | operator.
-        """
-        assert isinstance(other, Callback)
 
-        def call_both():
-            self.fire()
-            other.fire()
+# Cache of signatures. Improves the performance of `test_callable_args`.
+_signatures_cache = weakref.WeakKeyDictionary()
 
-        return Callback(call_both)
+
+def test_callable_args(func, args):
+    """
+    Return True when this function can be called with the given arguments.
+    """
+    assert isinstance(args, (list, tuple))
+    signature = getattr(inspect, 'signature', None)
+
+    if signature is not None:
+        # For Python 3, use inspect.signature.
+        try:
+            sig = _signatures_cache[func]
+        except KeyError:
+            sig = signature(func)
+            _signatures_cache[func] = sig
+
+        try:
+            sig.bind(*args)
+        except TypeError:
+            return False
+        else:
+            return True
+    else:
+        # For older Python versions, fall back to using getargspec.
+        spec = inspect.getargspec(func)
+
+        # Drop the 'self'
+        def drop_self(spec):
+            args, varargs, varkw, defaults = spec
+            if args[0:1] == ['self']:
+                args = args[1:]
+            return inspect.ArgSpec(args, varargs, varkw, defaults)
+
+        spec = drop_self(spec)
+
+        # When taking *args, always return True.
+        if spec.varargs is not None:
+            return True
+
+        # Test whether the given amount of args is between the min and max
+        # accepted argument counts.
+        return len(spec.args) - len(spec.defaults or []) <= len(args) <= len(spec.args)
 
 
 class DummyContext(object):
@@ -103,7 +154,11 @@ class _CharSizesCache(dict):
         else:
             result = sum(max(0, wcwidth(c)) for c in string)
 
-        self[string] = result
+        # Cache for short strings.
+        # (It's hard to tell what we can consider short...)
+        if len(string) < 256:
+            self[string] = result
+
         return result
 
 
@@ -144,37 +199,6 @@ def in_main_thread():
     True when the current thread is the main thread.
     """
     return threading.current_thread().__class__.__name__ == '_MainThread'
-
-
-class SimpleLRUCache(object):
-    """
-    Very simple LRU cache.
-
-    :param maxsize: Maximum size of the cache. (Don't make it too big.)
-    """
-    def __init__(self, maxsize=8):
-        self.maxsize = maxsize
-        self._cache = []  # List of (key, value).
-
-    def get(self, key, getter_func):
-        """
-        Get object from the cache.
-        If not found, call `getter_func` to resolve it, and put that on the top
-        of the cache instead.
-        """
-        # Look in cache first.
-        for k, v in self._cache:
-            if k == key:
-                return v
-
-        # Not found? Get it.
-        value = getter_func()
-        self._cache.append((key, value))
-
-        if len(self._cache) > self.maxsize:
-            self._cache = self._cache[-self.maxsize:]
-
-        return value
 
 
 def take_using_weights(items, weights):

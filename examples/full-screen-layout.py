@@ -11,24 +11,23 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.interface import CommandLineInterface
-from prompt_toolkit.key_binding.manager import KeyBindingManager
+from prompt_toolkit.key_binding.defaults import load_key_bindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.containers import VSplit, HSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FillControl, TokenListControl
 from prompt_toolkit.layout.dimension import LayoutDimension as D
 from prompt_toolkit.shortcuts import create_eventloop
-
-from pygments.token import Token
+from prompt_toolkit.token import Token
 
 
 # 1. First we create the layout
 #    --------------------------
 
-# There are two types of classes that have to be combined to contruct a layout.
+# There are two types of classes that have to be combined to construct a layout.
 # We have containers and user controls. Simply said, containers are used for
 # arranging the layout, we have for instance `HSplit` and `VSplit`. And on the
 # other hand user controls paint the actual content. We have for instance
-# `BufferControl` and `TokenListControl`. An important interal difference is that
+# `BufferControl` and `TokenListControl`. An important internal difference is that
 # containers use absolute coordinates, while user controls paint on their own
 # `Screen` with a relative coordinates.
 
@@ -90,12 +89,11 @@ layout = HSplit([
 
 # As a demonstration, we will add just a ControlQ key binding to exit the
 # application.  Key bindings are registered in a
-# `prompt_toolkit.key_bindings.registry.Registry` instance. However instead of
-# starting with an empty `Registry` instance, usually you'd use a
-# `KeyBindingmanager`, because it prefills the registry with all of the key
-# bindings that are required for basic text editing.
+# `prompt_toolkit.key_bindings.registry.Registry` instance. We use the
+# `load_default_key_bindings` utility function to create a registry that
+# already contains the default key bindings.
 
-manager = KeyBindingManager()  # Start with the `KeyBindingManager`.
+registry = load_key_bindings()
 
 # Now add the Ctrl-Q binding. We have to pass `eager=True` here. The reason is
 # that there is another key *sequence* that starts with Ctrl-Q as well. Yes, a
@@ -114,13 +112,17 @@ manager = KeyBindingManager()  # Start with the `KeyBindingManager`.
 # `eager=True` to all key bindings, but do it when it conflicts with another
 # existing key binding, and you definitely want to override that behaviour.
 
-@manager.registry.add_binding(Keys.ControlQ, eager=True)
+@registry.add_binding(Keys.ControlC, eager=True)
+@registry.add_binding(Keys.ControlQ, eager=True)
 def _(event):
     """
-    Pressing Ctrl-Q will exit the user interface.
+    Pressing Ctrl-Q or Ctrl-C will exit the user interface.
 
     Setting a return value means: quit the event loop that drives the user
     interface and return this value from the `CommandLineInterface.run()` call.
+
+    Note that Ctrl-Q does not work on all terminals. Sometimes it requires
+    executing `stty -ixon`.
     """
     event.cli.set_return_value(None)
 
@@ -138,7 +140,7 @@ buffers={
 # Now we add an event handler that captures change events to the buffer on the
 # left. If the text changes over there, we'll update the buffer on the right.
 
-def default_buffer_changed():
+def default_buffer_changed(default_buffer):
     """
     When the buffer on the left (DEFAULT_BUFFER) changes, update the buffer on
     the right. We just reverse the text.
@@ -157,7 +159,7 @@ buffers[DEFAULT_BUFFER].on_text_changed += default_buffer_changed
 application = Application(
     layout=layout,
     buffers=buffers,
-    key_bindings_registry=manager.registry,
+    key_bindings_registry=registry,
 
     # Let's add mouse support!
     mouse_support=True,

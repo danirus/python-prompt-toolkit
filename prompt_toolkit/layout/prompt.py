@@ -1,10 +1,9 @@
 from __future__ import unicode_literals
 
-from pygments.token import Token
 from six import text_type
 
 from prompt_toolkit.enums import IncrementalSearchDirection, SEARCH_BUFFER
-from prompt_toolkit.layout.utils import token_list_to_text
+from prompt_toolkit.token import Token
 
 from .utils import token_list_len
 from .processors import Processor, Transformation
@@ -46,7 +45,7 @@ class DefaultPrompt(Processor):
             return [(Token.Prompt, message)]
         return cls(get_message_tokens)
 
-    def apply_transformation(self, cli, document, tokens):
+    def apply_transformation(self, cli, document, lineno, source_to_display, tokens):
         # Get text before cursor.
         if cli.is_searching:
             before = _get_isearch_tokens(cli)
@@ -60,8 +59,12 @@ class DefaultPrompt(Processor):
         # Insert before buffer text.
         shift_position = token_list_len(before)
 
+        # Only show the prompt before the first line. For the following lines,
+        # only indent using spaces.
+        if lineno != 0:
+            before = [(Token.Prompt, ' ' * shift_position)]
+
         return Transformation(
-                document=document.insert_before(token_list_to_text(before)),
                 tokens=before + tokens,
                 source_to_display=lambda i: i + shift_position,
                 display_to_source=lambda i: i - shift_position)
@@ -75,15 +78,6 @@ class DefaultPrompt(Processor):
         # So, we can still show the cursor here, while it's actually not this
         # buffer that's focussed.
         return cli.is_searching
-
-    def invalidation_hash(self, cli, document):
-        return (
-            cli.input_processor.arg,
-            cli.is_searching,
-            cli.is_searching and cli.search_state.direction,
-            cli.buffers[SEARCH_BUFFER].text,
-            self.get_tokens(cli),
-        )
 
 
 def _get_isearch_tokens(cli):

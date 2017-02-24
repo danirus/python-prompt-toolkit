@@ -1,20 +1,35 @@
 from __future__ import unicode_literals
-from inspect import ArgSpec
 from six import with_metaclass
+from collections import defaultdict
+import weakref
 
 __all__ = (
     'CLIFilter',
     'SimpleFilter',
-    'check_signatures_are_equal',
 )
+
+# Cache for _FilterTypeMeta. (Don't test the same __instancecheck__ twice as
+# long as the object lives. -- We do this a lot and calling 'test_args' is
+# expensive.)
+_instance_check_cache = defaultdict(weakref.WeakKeyDictionary)
+
 
 class _FilterTypeMeta(type):
     def __instancecheck__(cls, instance):
-        if not hasattr(instance, 'getargspec'):
-            return False
+        cache = _instance_check_cache[tuple(cls.arguments_list)]
 
-        arguments = _drop_self(instance.getargspec())
-        return arguments.args == cls.arguments_list or arguments.varargs is not None
+        def get():
+            " The actual test. "
+            if not hasattr(instance, 'test_args'):
+                return False
+            return instance.test_args(*cls.arguments_list)
+
+        try:
+            return cache[instance]
+        except KeyError:
+            result = get()
+            cache[instance] = result
+            return result
 
 
 class _FilterType(with_metaclass(_FilterTypeMeta)):
@@ -38,26 +53,3 @@ class SimpleFilter(_FilterType):
     Abstract base class for filters that don't accept any arguments.
     """
     arguments_list = []
-
-
-def _drop_self(spec):
-    """
-    Take an argspec and return a new one without the 'self'.
-    """
-    args, varargs, varkw, defaults = spec
-    if args[0:1] == ['self']:
-        args = args[1:]
-    return ArgSpec(args, varargs, varkw, defaults)
-
-
-def check_signatures_are_equal(lst):
-    """
-    Check whether all filters in this list have the same signature.
-    Raises `TypeError` if not.
-    """
-    spec = _drop_self(lst[0].getargspec())
-
-    for f in lst[1:]:
-        if _drop_self(f.getargspec()) != spec:
-            raise TypeError('Trying to chain filters with different signature: %r and %r' %
-                            (lst[0], f))

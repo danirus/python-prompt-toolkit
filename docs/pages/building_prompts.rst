@@ -34,8 +34,9 @@ In the following sections, we will discover all these parameters.
 
     ``prompt_toolkit`` expects unicode strings everywhere. If you are using
     Python 2, make sure that all strings which are passed to ``prompt_toolkit``
-    are unicode strings (and not bytes). Either import ``unicode_literals`` or
-    explicitely put a small 'u' in front of every string.
+    are unicode strings (and not bytes). Either use 
+    ``from __future__ import unicode_literals`` or explicitely put a small 
+    ``'u'`` in front of every string.
 
 
 Syntax highlighting
@@ -66,34 +67,61 @@ Colors
 The colors for syntax highlighting are defined by a
 :class:`~prompt_toolkit.styles.Style` instance.  By default, a neutral built-in
 style is used, but any style instance can be passed to the
-:func:`~prompt_toolkit.shortcuts.prompt` function. All Pygments style classes
-can be used as well, when they are wrapped in a
-:class:`~prompt_toolkit.styles.PygmentsStyle`.
+:func:`~prompt_toolkit.shortcuts.prompt` function. A simple way to create a
+style, is by using the :class:`~prompt_toolkit.styles.style_from_dict`
+function:
+
+.. code:: python
+
+    from pygments.lexers import HtmlLexer
+    from prompt_toolkit.shortcuts import prompt
+    from prompt_toolkit.token import Token
+    from prompt_toolkit.styles import style_from_dict
+    from prompt_toolkit.layout.lexers import PygmentsLexer
+
+    our_style = style_from_dict({
+        Token.Comment:   '#888888 bold',
+        Token.Keyword:   '#ff88ff bold',
+    })
+
+    text = prompt('Enter HTML: ', lexer=PygmentsLexer(HtmlLexer),
+                  style=our_style)
+
+
+The style dictionary is very similar to the Pygments ``styles`` dictionary,
+with a few differences:
+
+- The `roman`, `sans`, `mono` and `border` options are not ignored.
+- The style has a few additions: `blink`, `noblink`, `reverse` and `noreverse`.
+- Colors can be in the `#ff0000` format, but they can be one of the built-in
+  ANSI color names as well. In that case, they map directly to the 16 color
+  palette of the terminal.
+
+Using a Pygments style
+^^^^^^^^^^^^^^^^^^^^^^
+
+All Pygments style classes can be used as well, when they are wrapped through
+:func:`~prompt_toolkit.styles.style_from_pygments`.
 
 Suppose we'd like to use a Pygments style, for instance
-``pygments.styles.tango.TangoStyle``. That works when we wrap it inside
-:class:`~prompt_toolkit.styles.PygmentsStyle`, but we would still miss some
-``prompt_toolkit`` specific styling, like the highlighting of selected text and
-the styling of the completion menus. Because of that, we recommend to use the
-:meth:`~prompt_toolkit.styles.PygmentsStyle.from_defaults` method to generate a
-a :class:`~prompt_toolkit.styles.Style` instance.
+``pygments.styles.tango.TangoStyle``, that is possible like this:
 
 Creating a custom style could be done like this:
 
 .. code:: python
 
     from prompt_toolkit.shortcuts import prompt
-    from prompt_toolkit.styles import PygmentsStyle
+    from prompt_toolkit.styles import style_from_pygments
+    from prompt_toolkit.layout.lexers import PygmentsLexer
 
-    from pygments.style import Style
     from pygments.styles.tango import TangoStyle
+    from pygments.token import Token
+    from pygments.lexers import HtmlLexer
 
-    our_style = PygmentsStyle.from_defaults(
-        pygments_style_cls=TangoStyle,
-        style_dict={
-            Token.Comment:   '#888888 bold',
-            Token.Keyword:   '#ff88ff bold',
-        })
+    our_style = style_from_pygments(TangoStyle, {
+        Token.Comment:   '#888888 bold',
+        Token.Keyword:   '#ff88ff bold',
+    })
 
     text = prompt('Enter HTML: ', lexer=PygmentsLexer(HtmlLexer),
                   style=our_style)
@@ -111,10 +139,9 @@ Each token is a Pygments token and can be styled individually.
 .. code:: python
 
     from prompt_toolkit.shortcuts import prompt
-    from pygments.style import Style
-    from prompt_toolkit.styles import PygmentsStyle
+    from prompt_toolkit.styles import style_from_dict
 
-    example_style = PygmentsStyle.from_defaults({
+    example_style = style_from_dict({
         # User input.
         Token:          '#ff0066',
 
@@ -138,6 +165,44 @@ Each token is a Pygments token and can be styled individually.
         ]
 
     text = prompt(get_prompt_tokens=get_prompt_tokens, style=example_style)
+
+By default, colors are taking from the 256 color palette. If you want to have
+24bit true color, this is possible by adding the ``true_color=True`` option to
+the ``prompt`` function.
+
+.. code:: python
+
+    text = prompt(get_prompt_tokens=get_prompt_tokens, style=example_style,
+                  true_color=True)
+
+
+Printing text (output) in color
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Besides prompting for input, we often have to print some output in color. This
+is simple with the :func:`~prompt_toolkit.shortcuts.print_tokens` function.
+
+.. code:: python
+
+    from prompt_toolkit.shortcuts import print_tokens
+    from prompt_toolkit.styles import style_from_dict
+    from pygments.token import Token
+
+    # Create a stylesheet.
+    style = style_from_dict({
+        Token.Hello: '#ff0066',
+        Token.World: '#44ff44 italic',
+    })
+
+    # Make a list of (Token, text) tuples.
+    tokens = [
+        (Token.Hello, 'Hello '),
+        (Token.World, 'World'),
+        (Token, '\n'),
+    ]
+
+    # Print the result.
+    print_tokens(tokens, style=style)
 
 
 Autocompletion
@@ -178,7 +243,7 @@ instance:
         def get_completions(self, document, complete_event):
             yield Completion('completion', start_position=0)
 
-    text = prompt('> ', completer=MyCustomCompleter)
+    text = prompt('> ', completer=MyCustomCompleter())
 
 A :class:`~prompt_toolkit.completion.Completer` class has to implement a
 generator named :meth:`~prompt_toolkit.completion.Completer.get_completions`
@@ -268,7 +333,7 @@ Auto suggestion is a way to propose some input completions to the user like the
 
 Usually, the input is compared to the history and when there is another entry
 starting with the given text, the completion will be shown as gray text behind
-the current input. Pressing the right arrow will insert this suggestion.
+the current input. Pressing the right arrow :kbd:`→` will insert this suggestion.
 
 .. note:: 
 
@@ -280,8 +345,11 @@ Example:
 
 .. code:: python
 
+    from prompt_toolkit import prompt
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+
+    history = InMemoryHistory()
 
     while True:
         text = prompt('> ', history=history, auto_suggest=AutoSuggestFromHistory())
@@ -305,17 +373,57 @@ list of tokens. The toolbar is always erased when the prompt returns.
 
 .. code:: python
 
-    from pygments.token import Token
+    from prompt_toolkit import prompt
+    from prompt_toolkit.styles import style_from_dict
+    from prompt_toolkit.token import Token
 
     def get_bottom_toolbar_tokens(cli):
         return [(Token.Toolbar, ' This is a toolbar. ')]
 
-    text = prompt('> ', get_bottom_toolbar_tokens=get_bottom_toolbar_tokens)
+    style = style_from_dict({
+        Token.Toolbar: '#ffffff bg:#333333',
+    })
+
+    text = prompt('> ', get_bottom_toolbar_tokens=get_bottom_toolbar_tokens,
+                  style=style)
     print('You said: %s' % text)
 
 The default token is ``Token.Toolbar`` and that will also be used to fill the
 background of the toolbar. :ref:`Styling <colors>` can be done by pointing to
 that token.
+
+.. image:: ../images/bottom-toolbar.png
+
+Adding a right prompt
+---------------------
+
+The :func:`~prompt_toolkit.shortcuts.prompt` function has out of the box
+support for right prompts as well. People familiar to ZSH could recognise this
+as the `RPROMPT` option.
+
+So, similar to adding a bottom toolbar, we can pass a ``get_rprompt_tokens``
+callable.
+
+.. code:: python
+
+    from prompt_toolkit import prompt
+    from prompt_toolkit.styles import style_from_dict
+    from prompt_toolkit.token import Token
+
+    example_style = style_from_dict({
+        Token.RPrompt: 'bg:#ff0066 #ffffff',
+    })
+
+    def get_rprompt_tokens(cli):
+        return [
+            (Token, ' '),
+            (Token.RPrompt, '<rprompt>'),
+        ]
+
+    answer = prompt('> ', get_rprompt_tokens=get_rprompt_tokens,
+                    style=example_style)
+
+.. image:: ../images/rprompt.png
 
 
 Vi input mode
@@ -348,7 +456,7 @@ usually, for a prompt, we would like to have at least the basic (Emacs/Vi)
 bindings and start from there. That's what the
 :class:`~prompt_toolkit.key_binding.manager.KeyBindingManager` class does.
 
-An example of a prompt that prints 'hello world' when Control-T is pressed.
+An example of a prompt that prints ``'hello world'`` when :kbd:`Control-T` is pressed.
 
 .. code:: python
 
@@ -392,7 +500,6 @@ filters <filters>`.)
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.key_binding.manager import KeyBindingManager
     from prompt_toolkit.keys import Keys
-    from pygments.token import Token
 
     manager = KeyBindingManager.for_prompt()
 
@@ -411,17 +518,9 @@ filters <filters>`.)
 Dynamically switch between Emacs and Vi mode
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The :class:`~prompt_toolkit.key_binding.manager.KeyBindingManager` class
-accepts an ``enable_vi_mode`` argument. When this is ``True``, the Vi bindings
-will be active, when ``False``, the Emacs bindings will be active. One
-confusing thing here is that we can pass a boolean, but not change it
-afterwards. However, instead we can pass a
-:class:`~prompt_toolkit.filters.CLIFilter`, an expression that is True or
-False according to a certain condition.
-
-In our demonstration below, we are going to use a nonlocal variable
-``vi_mode_enabled`` to hold this state. (Of course, this state can be stored
-anywhere you want.)
+The :class:`~prompt_toolkit.interface.CommandLineInterface` has
+an ``editing_mode`` attribute. We can change the key bindings by changing this
+attribute from ``EditingMode.VI`` to ``EditingMode.EMACS``.
 
 .. code:: python
 
@@ -431,24 +530,24 @@ anywhere you want.)
     from prompt_toolkit.keys import Keys
 
     def run():
-        vi_mode_enabled = False
-
-        # Create a set of key bindings that have Vi mode enabled if the
-        # ``vi_mode_enabled`` is True..
-        manager = KeyBindingManager.for_prompt(
-            enable_vi_mode=Condition(lambda cli: vi_mode_enabled))
+        # Create a set of key bindings.
+        manager = KeyBindingManager.for_prompt()
 
         # Add an additional key binding for toggling this flag.
         @manager.registry.add_binding(Keys.F4)
         def _(event):
             " Toggle between Emacs and Vi mode. "
-            nonlocal vi_mode_enabled
-            vi_mode_enabled = not vi_mode_enabled
+            cli = event.cli
+
+            if cli.editing_mode == EditingMode.VI:
+                cli.editing_mode = EditingMode.EMACS
+            else:
+                cli.editing_mode = EditingMode.VI
 
         # Add a toolbar at the bottom to display the current input mode.
         def get_bottom_toolbar_tokens(cli):
             " Display the current input mode. "
-            text = 'Vi' if vi_mode_enabled else 'Emacs'
+            text = 'Vi' if cli.editing_mode == EditingMode.VI else 'Emacs'
             return [
                 (Token.Toolbar, ' [F4] %s ' % text)
             ]
@@ -475,8 +574,22 @@ Reading multiline input is as easy as passing the ``multiline=True`` parameter.
 
 A side effect of this is that the enter key will now insert a newline instead
 of accepting and returning the input. The user will now have to press
-``Meta+Enter`` in order to accept the input. (Or ``Escape`` folowed by
-``Enter``.)
+:kbd:`Meta+Enter` in order to accept the input. (Or :kbd:`Escape` followed by
+:kbd:`Enter`.)
+
+It is possible to specify a continuation prompt. This works by passing a
+``get_continuation_tokens`` callable to ``prompt``. This function can return a
+list of ``(Token, text)`` tuples. The width of the returned text should not
+exceed the given width. (The width of the prompt margin is defined by the
+prompt.)
+
+.. code:: python
+
+    def get_continuation_tokens(cli, width):
+        return [(Token, '.' * width)]
+
+    prompt('> ', multiline=True,
+           get_continuation_tokens=get_continuation_tokens)
 
 
 Passing a default
@@ -511,7 +624,7 @@ Enabling can be done by passing the ``mouse_support=True`` option.
 Line wrapping
 ^^^^^^^^^^^^^
 
-Line wrapping is enabled by default. This is what most people are used too and
+Line wrapping is enabled by default. This is what most people are used to and
 this is what GNU readline does. When it is disabled, the input string will
 scroll horizontally.
 
@@ -542,8 +655,8 @@ Prompt in an ``asyncio`` application
 
 For `asyncio <https://docs.python.org/3/library/asyncio.html>`_ applications,
 it's very important to never block the eventloop. However,
-:func:`~prompt_toolkit.shortcuts.prompt` is blocking and calling this would
-freeze the whole application. An alternative is to call this function, using
+:func:`~prompt_toolkit.shortcuts.prompt` is blocking, and calling this would
+freeze the whole application. A quick fix is to call this function via
 the asyncio ``eventloop.run_in_executor``, but that would cause the user
 interface to run in another thread. (If we have custom key bindings for
 instance, it would be better to run them in the same thread as the other code.)

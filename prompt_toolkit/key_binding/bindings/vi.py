@@ -1,19 +1,35 @@
 # pylint: disable=function-redefined
 from __future__ import unicode_literals
-from prompt_toolkit.buffer import ClipboardData, indent, unindent
+from prompt_toolkit.buffer import ClipboardData, indent, unindent, reshape_text
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import IncrementalSearchDirection, SEARCH_BUFFER, SYSTEM_BUFFER
-from prompt_toolkit.filters import Filter, Condition, HasArg, Always, to_cli_filter, IsReadOnly
+from prompt_toolkit.filters import Filter, Condition, HasArg, Always, IsReadOnly
+from prompt_toolkit.filters.cli import ViNavigationMode, ViInsertMode, ViInsertMultipleMode, ViReplaceMode, ViSelectionMode, ViWaitingForTextObjectMode, ViDigraphMode, ViMode
+from prompt_toolkit.key_binding.digraphs import DIGRAPHS
 from prompt_toolkit.key_binding.vi_state import CharacterFind, InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout.utils import find_window_for_buffer_name
-from prompt_toolkit.selection import SelectionType
+from prompt_toolkit.selection import SelectionType, SelectionState, PasteMode
 
-from .utils import create_handle_decorator
 from .scroll import scroll_forward, scroll_backward, scroll_half_page_up, scroll_half_page_down, scroll_one_line_up, scroll_one_line_down, scroll_page_up, scroll_page_down
+from .named_commands import get_by_name
+from ..registry import Registry, ConditionalRegistry, BaseRegistry
 
 import prompt_toolkit.filters as filters
+from six.moves import range
 import codecs
+import six
+import string
+
+try:
+    from itertools import accumulate
+except ImportError: # < Python 3.2
+    def accumulate(iterable):
+        " Super simpel 'accumulate' implementation. "
+        total = 0
+        for item in iterable:
+            total += item
+            yield total
 
 __all__ = (
     'load_vi_bindings',
@@ -22,35 +38,39 @@ __all__ = (
     'load_extra_vi_page_navigation_bindings',
 )
 
+if six.PY2:
+    ascii_lowercase = string.ascii_lowercase.decode('ascii')
+else:
+    ascii_lowercase = string.ascii_lowercase
 
-class ViStateFilter(Filter):
+vi_register_names = ascii_lowercase + '0123456789'
+
+
+class TextObjectType(object):
+    EXCLUSIVE = 'EXCLUSIVE'
+    INCLUSIVE = 'INCLUSIVE'
+    LINEWISE = 'LINEWISE'
+    BLOCK = 'BLOCK'
+
+
+class TextObject(object):
     """
-    Filter to enable some key bindings only in a certain Vi input mode.
-
-    :param get_vi_state: Callable that takes a `CommandLineInterface` and
-        returns a :class:`~prompt_toolkit.key_binding.vi_state.ViState` instance.
-    """
-    # Note: The reason for making get_vi_state a callable, is that this way,
-    #       the registry of key bindings becomes more stateless and can be
-    #       reused for multiple CommandLineInterface instances.
-    def __init__(self, get_vi_state, mode):
-        assert callable(get_vi_state)
-
-        self.get_vi_state = get_vi_state
-        self.mode = mode
-
-    def __call__(self, cli):
-        return self.get_vi_state(cli).input_mode == self.mode
-
-
-class CursorRegion(object):
-    """
-    Return struct for functions wrapped in ``change_delete_move_yank_handler``.
+    Return struct for functions wrapped in ``text_object``.
     Both `start` and `end` are relative to the current cursor position.
     """
-    def __init__(self, start, end=0):
+    def __init__(self, start, end=0, type=TextObjectType.EXCLUSIVE):
         self.start = start
         self.end = end
+        self.type = type
+
+    @property
+    def selection_type(self):
+        if self.type == TextObjectType.LINEWISE:
+            return SelectionType.LINES
+        if self.type == TextObjectType.BLOCK:
+            return SelectionType.BLOCK
+        else:
+            return SelectionType.CHARACTERS
 
     def sorted(self):
         """
@@ -61,18 +81,231 @@ class CursorRegion(object):
         else:
             return self.end, self.start
 
+    def operator_range(self, document):
+        """
+        Return a (start, end) tuple with start <= end that indicates the range
+        operators should operate on.
+        `buffer` is used to get start and end of line positions.
+        """
+        start, end = self.sorted()
+        doc = document
 
-def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_search_state=None, filter=None):
+        if (self.type == TextObjectType.EXCLUSIVE and
+                doc.translate_index_to_position(end + doc.cursor_position)[1] == 0):
+            # If the motion is exclusive and the end of motion is on the first
+            # column, the end position becomes end of previous line.
+            end -= 1
+        if self.type == TextObjectType.INCLUSIVE:
+            end += 1
+        if self.type == TextObjectType.LINEWISE:
+            # Select whole lines
+            row, col = doc.translate_index_to_position(start + doc.cursor_position)
+            start = doc.translate_row_col_to_index(row, 0) - doc.cursor_position
+            row, col = doc.translate_index_to_position(end + doc.cursor_position)
+            end = doc.translate_row_col_to_index(row, len(doc.lines[row])) - doc.cursor_position
+        return start, end
+
+    def get_line_numbers(self, buffer):
+        """
+        Return a (start_line, end_line) pair.
+        """
+        # Get absolute cursor positions from the text object.
+        from_, to = self.operator_range(buffer.document)
+        from_ += buffer.cursor_position
+        to += buffer.cursor_position
+
+        # Take the start of the lines.
+        from_, _ = buffer.document.translate_index_to_position(from_)
+        to, _ = buffer.document.translate_index_to_position(to)
+
+        return from_, to
+
+    def cut(self, buffer):
+        """
+        Turn text object into `ClipboardData` instance.
+        """
+        from_, to = self.operator_range(buffer.document)
+
+        from_ += buffer.cursor_position
+        to += buffer.cursor_position
+        to -= 1  # SelectionState does not include the end position, `operator_range` does.
+
+        document = Document(buffer.text, to, SelectionState(
+            original_cursor_position=from_, type=self.selection_type))
+
+        new_document, clipboard_data = document.cut_selection()
+        return new_document, clipboard_data
+
+
+def create_text_object_decorator(registry):
+    """
+    Create a decorator that can be used to register Vi text object implementations.
+    """
+    assert isinstance(registry, BaseRegistry)
+
+    operator_given = ViWaitingForTextObjectMode()
+    navigation_mode = ViNavigationMode()
+    selection_mode = ViSelectionMode()
+
+    def text_object_decorator(*keys, **kw):
+        """
+        Register a text object function.
+
+        Usage::
+
+            @text_object('w', filter=..., no_move_handler=False)
+            def handler(event):
+                # Return a text object for this key.
+                return TextObject(...)
+
+        :param no_move_handler: Disable the move handler in navigation mode.
+            (It's still active in selection mode.)
+        """
+        filter = kw.pop('filter', Always())
+        no_move_handler = kw.pop('no_move_handler', False)
+        no_selection_handler = kw.pop('no_selection_handler', False)
+        eager = kw.pop('eager', False)
+        assert not kw
+
+        def decorator(text_object_func):
+            assert callable(text_object_func)
+
+            @registry.add_binding(*keys, filter=operator_given & filter, eager=eager)
+            def _(event):
+                # Arguments are multiplied.
+                vi_state = event.cli.vi_state
+                event._arg = (vi_state.operator_arg or 1) * (event.arg or 1)
+
+                # Call the text object handler.
+                text_obj = text_object_func(event)
+                if text_obj is not None:
+                    assert isinstance(text_obj, TextObject)
+
+                    # Call the operator function with the text object.
+                    vi_state.operator_func(event, text_obj)
+
+                # Clear operator.
+                event.cli.vi_state.operator_func = None
+                event.cli.vi_state.operator_arg = None
+
+            # Register a move operation. (Doesn't need an operator.)
+            if not no_move_handler:
+                @registry.add_binding(*keys, filter=~operator_given & filter & navigation_mode, eager=eager)
+                def _(event):
+                    " Move handler for navigation mode. "
+                    text_object = text_object_func(event)
+                    event.current_buffer.cursor_position += text_object.start
+
+            # Register a move selection operation.
+            if not no_selection_handler:
+                @registry.add_binding(*keys, filter=~operator_given & filter & selection_mode, eager=eager)
+                def _(event):
+                    " Move handler for selection mode. "
+                    text_object = text_object_func(event)
+                    buff = event.current_buffer
+
+                    # When the text object has both a start and end position, like 'i(' or 'iw',
+                    # Turn this into a selection, otherwise the cursor.
+                    if text_object.end:
+                        # Take selection positions from text object.
+                        start, end = text_object.operator_range(buff.document)
+                        start += buff.cursor_position
+                        end += buff.cursor_position
+
+                        buff.selection_state.original_cursor_position = start
+                        buff.cursor_position = end
+
+                        # Take selection type from text object.
+                        if text_object.type == TextObjectType.LINEWISE:
+                            buff.selection_state.type = SelectionType.LINES
+                        else:
+                            buff.selection_state.type = SelectionType.CHARACTERS
+                    else:
+                        event.current_buffer.cursor_position += text_object.start
+
+            # Make it possible to chain @text_object decorators.
+            return text_object_func
+
+        return decorator
+    return text_object_decorator
+
+
+def create_operator_decorator(registry):
+    """
+    Create a decorator that can be used for registering Vi operators.
+    """
+    assert isinstance(registry, BaseRegistry)
+
+    operator_given = ViWaitingForTextObjectMode()
+    navigation_mode = ViNavigationMode()
+    selection_mode = ViSelectionMode()
+
+    def operator_decorator(*keys, **kw):
+        """
+        Register a Vi operator.
+
+        Usage::
+
+            @operator('d', filter=...)
+            def handler(cli, text_object):
+                # Do something with the text object here.
+        """
+        filter = kw.pop('filter', Always())
+        eager = kw.pop('eager', False)
+        assert not kw
+
+        def decorator(operator_func):
+            @registry.add_binding(*keys, filter=~operator_given & filter & navigation_mode, eager=eager)
+            def _(event):
+                """
+                Handle operator in navigation mode.
+                """
+                # When this key binding is matched, only set the operator
+                # function in the ViState. We should execute it after a text
+                # object has been received.
+                event.cli.vi_state.operator_func = operator_func
+                event.cli.vi_state.operator_arg = event.arg
+
+            @registry.add_binding(*keys, filter=~operator_given & filter & selection_mode, eager=eager)
+            def _(event):
+                """
+                Handle operator in selection mode.
+                """
+                buff = event.current_buffer
+                selection_state = buff.selection_state
+
+                # Create text object from selection.
+                if selection_state.type == SelectionType.LINES:
+                    text_obj_type = TextObjectType.LINEWISE
+                elif selection_state.type == SelectionType.BLOCK:
+                    text_obj_type = TextObjectType.BLOCK
+                else:
+                    text_obj_type = TextObjectType.INCLUSIVE
+
+                text_object = TextObject(
+                    selection_state.original_cursor_position - buff.cursor_position,
+                    type=text_obj_type)
+
+                # Execute operator.
+                operator_func(event, text_object)
+
+                # Quit selection mode.
+                buff.selection_state = None
+
+            return operator_func
+        return decorator
+    return operator_decorator
+
+
+def load_vi_bindings(get_search_state=None):
     """
     Vi extensions.
 
     # Overview of Readline Vi commands:
     # http://www.catonmat.net/download/bash-vi-editing-mode-cheat-sheet.pdf
 
-    :param get_vi_state: Callable that takes a CommandLineInterface instances and returns the used ViState.
-    :param enable_visual_key: Filter to enable lowercase 'v' bindings. A reason to disable these
-         are to support open-in-editor functionality. These key bindings conflict.
-     :param get_search_state: None or a callable that takes a CommandLineInterface and returns a SearchState.
+     :param get_search_state: None or a callable that takes a
+        CommandLineInterface and returns a SearchState.
     """
     # Note: Some key bindings have the "~IsReadOnly()" filter added. This
     #       prevents the handler to be executed when the focus is on a
@@ -83,52 +316,40 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
     #       handled correctly. There is no need to add "~IsReadOnly" to all key
     #       bindings that do text manipulation.
 
-    assert callable(get_vi_state)
-    enable_visual_key = to_cli_filter(enable_visual_key)
+    registry = ConditionalRegistry(Registry(), ViMode())
+    handle = registry.add_binding
 
     # Default get_search_state.
     if get_search_state is None:
         def get_search_state(cli): return cli.search_state
 
-    handle = create_handle_decorator(registry, filter)
-
-    insert_mode = ViStateFilter(get_vi_state, InputMode.INSERT) & ~ filters.HasSelection()
-    navigation_mode = ViStateFilter(get_vi_state, InputMode.NAVIGATION) & ~ filters.HasSelection()
-    replace_mode = ViStateFilter(get_vi_state, InputMode.REPLACE) & ~ filters.HasSelection()
-    selection_mode = filters.HasSelection()
+    # (Note: Always take the navigation bindings in read-only mode, even when
+    #  ViState says different.)
+    navigation_mode = ViNavigationMode()
+    insert_mode = ViInsertMode()
+    insert_multiple_mode = ViInsertMultipleMode()
+    replace_mode = ViReplaceMode()
+    selection_mode = ViSelectionMode()
+    operator_given = ViWaitingForTextObjectMode()
+    digraph_mode = ViDigraphMode()
 
     vi_transform_functions = [
         # Rot 13 transformation
-        (('g', '?'), lambda string: codecs.encode(string, 'rot_13')),
+        (('g', '?'), Always(), lambda string: codecs.encode(string, 'rot_13')),
 
         # To lowercase
-        (('g', 'u'), lambda string: string.lower()),
+        (('g', 'u'), Always(), lambda string: string.lower()),
 
         # To uppercase.
-        (('g', 'U'), lambda string: string.upper()),
+        (('g', 'U'), Always(), lambda string: string.upper()),
 
         # Swap case.
-        # (XXX: If we would implement 'tildeop', the 'g' prefix is not required.)
-        (('g', '~'), lambda string: string.swapcase()),
+        (('g', '~'), Always(), lambda string: string.swapcase()),
+        (('~', ), Condition(lambda cli: cli.vi_state.tilde_operator), lambda string: string.swapcase()),
     ]
 
-    def check_cursor_position(event):
-        """
-        After every command, make sure that if we are in navigation mode, we
-        never put the cursor after the last character of a line. (Unless it's
-        an empty line.)
-        """
-        buffer = event.current_buffer
-
-        if (
-                (filter is None or filter(event.cli)) and  # First make sure that this key bindings are active.
-
-                get_vi_state(event.cli).input_mode == InputMode.NAVIGATION and
-                buffer.document.is_cursor_at_the_end_of_line and
-                len(buffer.document.current_line) > 0):
-            buffer.cursor_position -= 1
-
-    registry.on_handler_called += check_cursor_position
+    # Insert a character literally (quoted insert).
+    handle(Keys.ControlV, filter=insert_mode)(get_by_name('quoted-insert'))
 
     @handle(Keys.Escape)
     def _(event):
@@ -136,12 +357,12 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         Escape goes to vi navigation mode.
         """
         buffer = event.current_buffer
-        vi_state = get_vi_state(event.cli)
+        vi_state = event.cli.vi_state
 
         if vi_state.input_mode in (InputMode.INSERT, InputMode.REPLACE):
             buffer.cursor_position += buffer.document.get_cursor_left_position()
 
-        vi_state.input_mode = InputMode.NAVIGATION
+        vi_state.reset(InputMode.NAVIGATION)
 
         if bool(buffer.selection_state):
             buffer.exit_selection()
@@ -160,26 +381,40 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.cursor_down(count=event.arg)
 
-    @handle('k', filter=navigation_mode)
     @handle(Keys.Up, filter=navigation_mode)
     @handle(Keys.ControlP, filter=navigation_mode)
     def _(event):
         """
         Arrow up and ControlP in navigation mode go up.
         """
-        b = event.current_buffer
-        b.auto_up(count=event.arg)
+        event.current_buffer.auto_up(count=event.arg)
 
-    @handle('j', filter=navigation_mode)
+    @handle('k', filter=navigation_mode)
+    def _(event):
+        """
+        Go up, but if we enter a new history entry, move to the start of the
+        line.
+        """
+        event.current_buffer.auto_up(
+            count=event.arg, go_to_start_of_line_if_history_changes=True)
+
     @handle(Keys.Down, filter=navigation_mode)
     @handle(Keys.ControlN, filter=navigation_mode)
     def _(event):
         """
         Arrow down and Control-N in navigation mode.
         """
-        b = event.current_buffer
-        b.auto_down(count=event.arg)
+        event.current_buffer.auto_down(count=event.arg)
 
+    @handle('j', filter=navigation_mode)
+    def _(event):
+        """
+        Go down, but if we enter a new history entry, go to the start of the line.
+        """
+        event.current_buffer.auto_down(
+            count=event.arg, go_to_start_of_line_if_history_changes=True)
+
+    @handle(Keys.ControlH, filter=navigation_mode)
     @handle(Keys.Backspace, filter=navigation_mode)
     def _(event):
         """
@@ -187,13 +422,6 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.cursor_position += \
             event.current_buffer.document.get_cursor_left_position(count=event.arg)
-
-    @handle(Keys.ControlV, Keys.Any, filter=insert_mode)
-    def _(event):
-        """
-        Insert a character literally (quoted insert).
-        """
-        event.current_buffer.insert_text(event.data, overwrite=False)
 
     @handle(Keys.ControlN, filter=insert_mode)
     def _(event):
@@ -230,7 +458,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.cancel_completion()
 
-    @handle(Keys.ControlJ, filter=navigation_mode)
+    @handle(Keys.ControlJ, filter=navigation_mode)   # XXX: only if the selected buffer has a return handler.
     def _(event):
         """
         In navigation mode, pressing enter will always return the input.
@@ -247,19 +475,19 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
     @handle(Keys.Insert, filter=navigation_mode)
     def _(event):
         " Presing the Insert key. "
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('a', filter=navigation_mode & ~IsReadOnly())
             # ~IsReadOnly, because we want to stay in navigation mode for
             # read-only buffers.
     def _(event):
         event.current_buffer.cursor_position += event.current_buffer.document.get_cursor_right_position()
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('A', filter=navigation_mode & ~IsReadOnly())
     def _(event):
         event.current_buffer.cursor_position += event.current_buffer.document.get_end_of_line_position()
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('C', filter=navigation_mode & ~IsReadOnly())
     def _(event):
@@ -271,7 +499,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
 
         deleted = buffer.delete(count=buffer.document.get_end_of_line_position())
         event.cli.clipboard.set_text(deleted)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('c', 'c', filter=navigation_mode & ~IsReadOnly())
     @handle('S', filter=navigation_mode & ~IsReadOnly())
@@ -288,7 +516,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         # But we delete after the whitespace
         buffer.cursor_position += buffer.document.get_start_of_line_position(after_whitespace=True)
         buffer.delete(count=buffer.document.get_end_of_line_position())
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('D', filter=navigation_mode)
     def _(event):
@@ -307,7 +535,8 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         lines = buffer.document.lines
 
         before = '\n'.join(lines[:buffer.document.cursor_position_row])
-        deleted = '\n'.join(lines[buffer.document.cursor_position_row: buffer.document.cursor_position_row + event.arg])
+        deleted = '\n'.join(lines[buffer.document.cursor_position_row:
+                                  buffer.document.cursor_position_row + event.arg])
         after = '\n'.join(lines[buffer.document.cursor_position_row + event.arg:])
 
         # Set new text.
@@ -323,43 +552,81 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         # Set clipboard data
         event.cli.clipboard.set_data(ClipboardData(deleted, SelectionType.LINES))
 
+    @handle('x', filter=selection_mode)
+    def _(event):
+        """
+        Cut selection.
+        ('x' is not an operator.)
+        """
+        clipboard_data = event.current_buffer.cut_selection()
+        event.cli.clipboard.set_data(clipboard_data)
+
     @handle('i', filter=navigation_mode & ~IsReadOnly())
     def _(event):
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('I', filter=navigation_mode & ~IsReadOnly())
     def _(event):
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
-        event.current_buffer.cursor_position += event.current_buffer.document.get_start_of_line_position(after_whitespace=True)
+        event.cli.vi_state.input_mode = InputMode.INSERT
+        event.current_buffer.cursor_position += \
+            event.current_buffer.document.get_start_of_line_position(after_whitespace=True)
 
-    @handle('J', filter=navigation_mode)
+    @Condition
+    def in_block_selection(cli):
+        buff = cli.current_buffer
+        return buff.selection_state and buff.selection_state.type == SelectionType.BLOCK
+
+    @handle('I', filter=in_block_selection & ~IsReadOnly())
+    def go_to_block_selection(event, after=False):
+        " Insert in block selection mode. "
+        buff = event.current_buffer
+
+        # Store all cursor positions.
+        positions = []
+
+        if after:
+            def get_pos(from_to):
+                return from_to[1] + 1
+        else:
+            def get_pos(from_to):
+                return from_to[0]
+
+        for i, from_to in enumerate(buff.document.selection_ranges()):
+            positions.append(get_pos(from_to))
+            if i == 0:
+                buff.cursor_position = get_pos(from_to)
+
+        buff.multiple_cursor_positions = positions
+
+        # Go to 'INSERT_MULTIPLE' mode.
+        event.cli.vi_state.input_mode = InputMode.INSERT_MULTIPLE
+        buff.exit_selection()
+
+    @handle('A', filter=in_block_selection & ~IsReadOnly())
     def _(event):
-        """ Join lines. """
+        go_to_block_selection(event, after=True)
+
+    @handle('J', filter=navigation_mode & ~IsReadOnly())
+    def _(event):
+        " Join lines. "
         for i in range(event.arg):
             event.current_buffer.join_next_line()
 
-    @handle('J', filter=selection_mode)
+    @handle('g', 'J', filter=navigation_mode & ~IsReadOnly())
     def _(event):
-        """ Join selected lines. """
+        " Join lines without space. "
+        for i in range(event.arg):
+            event.current_buffer.join_next_line(separator='')
+
+    @handle('J', filter=selection_mode & ~IsReadOnly())
+    def _(event):
+        " Join selected lines. "
         event.current_buffer.join_selected_lines()
 
-    @handle('n', filter=navigation_mode)
-    def _(event):  # XXX: use `change_delete_move_yank_handler`
-        """
-        Search next.
-        """
-        event.current_buffer.apply_search(
-            get_search_state(event.cli), include_current_position=False,
-            count=event.arg)
-
-    @handle('N', filter=navigation_mode)
-    def _(event):  # TODO: use `change_delete_move_yank_handler`
-        """
-        Search previous.
-        """
-        event.current_buffer.apply_search(
-            ~get_search_state(event.cli), include_current_position=False,
-            count=event.arg)
+    @handle('g', 'J', filter=selection_mode & ~IsReadOnly())
+    def _(event):
+        " Join selected lines without space. "
+        event.current_buffer.join_selected_lines(separator='')
 
     @handle('p', filter=navigation_mode)
     def _(event):
@@ -368,7 +635,8 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.paste_clipboard_data(
             event.cli.clipboard.get_data(),
-            count=event.arg)
+            count=event.arg,
+            paste_mode=PasteMode.VI_AFTER)
 
     @handle('P', filter=navigation_mode)
     def _(event):
@@ -377,8 +645,28 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.paste_clipboard_data(
             event.cli.clipboard.get_data(),
-            before=True,
-            count=event.arg)
+            count=event.arg,
+            paste_mode=PasteMode.VI_BEFORE)
+
+    @handle('"', Keys.Any, 'p', filter=navigation_mode)
+    def _(event):
+        " Paste from named register. "
+        c = event.key_sequence[1].data
+        if c in vi_register_names:
+            data = event.cli.vi_state.named_registers.get(c)
+            if data:
+                event.current_buffer.paste_clipboard_data(
+                    data, count=event.arg, paste_mode=PasteMode.VI_AFTER)
+
+    @handle('"', Keys.Any, 'P', filter=navigation_mode)
+    def _(event):
+        " Paste (before) from named register. "
+        c = event.key_sequence[1].data
+        if c in vi_register_names:
+            data = event.cli.vi_state.named_registers.get(c)
+            if data:
+                event.current_buffer.paste_clipboard_data(
+                    data, count=event.arg, paste_mode=PasteMode.VI_BEFORE)
 
     @handle('r', Keys.Any, filter=navigation_mode)
     def _(event):
@@ -393,7 +681,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         Go to 'replace'-mode.
         """
-        get_vi_state(event.cli).input_mode = InputMode.REPLACE
+        event.cli.vi_state.input_mode = InputMode.REPLACE
 
     @handle('s', filter=navigation_mode & ~IsReadOnly())
     def _(event):
@@ -403,7 +691,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         text = event.current_buffer.delete(count=event.arg)
         event.cli.clipboard.set_text(text)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('u', filter=navigation_mode, save_before=(lambda e: False))
     def _(event):
@@ -416,6 +704,11 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         Start lines selection.
         """
         event.current_buffer.start_selection(selection_type=SelectionType.LINES)
+
+    @handle(Keys.ControlV, filter=navigation_mode)
+    def _(event):
+        " Enter block selection mode. "
+        event.current_buffer.start_selection(selection_type=SelectionType.BLOCK)
 
     @handle('V', filter=selection_mode)
     def _(event):
@@ -430,6 +723,11 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         else:
             event.current_buffer.exit_selection()
 
+    @handle('v', filter=navigation_mode)
+    def _(event):
+        " Enter character selection mode. "
+        event.current_buffer.start_selection(selection_type=SelectionType.CHARACTERS)
+
     @handle('v', filter=selection_mode)
     def _(event):
         """
@@ -440,6 +738,19 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
 
         if selection_state.type != SelectionType.CHARACTERS:
             selection_state.type = SelectionType.CHARACTERS
+        else:
+            event.current_buffer.exit_selection()
+
+    @handle(Keys.ControlV, filter=selection_mode)
+    def _(event):
+        """
+        Exit block selection mode, or go from non block selection mode to block
+        selection mode.
+        """
+        selection_state = event.current_buffer.selection_state
+
+        if selection_state.type != SelectionType.BLOCK:
+            selection_state.type = SelectionType.BLOCK
         else:
             event.current_buffer.exit_selection()
 
@@ -462,32 +773,6 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         text = event.current_buffer.delete(count=event.arg)
         event.cli.clipboard.set_text(text)
-
-    @handle('x', filter=selection_mode)
-    @handle('d', filter=selection_mode)
-    def _(event):
-        """
-        Cut selection.
-        """
-        clipboard_data = event.current_buffer.cut_selection()
-        event.cli.clipboard.set_data(clipboard_data)
-
-    @handle('c', filter=selection_mode & ~IsReadOnly())
-    def _(event):
-        """
-        Change selection (cut and go to insert mode).
-        """
-        clipboard_data = event.current_buffer.cut_selection()
-        event.cli.clipboard.set_data(clipboard_data)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
-
-    @handle('y', filter=selection_mode)
-    def _(event):
-        """
-        Copy selection.
-        """
-        clipboard_data = event.current_buffer.copy_selection()
-        event.cli.clipboard.set_data(clipboard_data)
 
     @handle('X', filter=navigation_mode)
     def _(event):
@@ -538,36 +823,6 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         current_row = event.current_buffer.document.cursor_position_row
         unindent(event.current_buffer, current_row, current_row + event.arg)
 
-    @handle('>', filter=selection_mode)
-    def _(event):
-        """
-        Indent selection
-        """
-        buffer = event.current_buffer
-        selection_type = buffer.selection_state.type
-
-        if selection_type == SelectionType.LINES:
-            from_, to = buffer.document.selection_range()
-            from_, _ = buffer.document.translate_index_to_position(from_)
-            to, _ = buffer.document.translate_index_to_position(to)
-
-            indent(buffer, from_ - 1, to, count=event.arg)  # XXX: why does translate_index_to_position return 1-based indexing???
-
-    @handle('<', filter=selection_mode)
-    def _(event):
-        """
-        Unindent selection
-        """
-        buffer = event.current_buffer
-        selection_type = buffer.selection_state.type
-
-        if selection_type == SelectionType.LINES:
-            from_, to = buffer.document.selection_range()
-            from_, _ = buffer.document.translate_index_to_position(from_)
-            to, _ = buffer.document.translate_index_to_position(to)
-
-            unindent(buffer, from_ - 1, to, count=event.arg)
-
     @handle('O', filter=navigation_mode & ~IsReadOnly())
     def _(event):
         """
@@ -575,7 +830,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.insert_line_above(
                 copy_margin=not event.cli.in_paste_mode)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('o', filter=navigation_mode & ~IsReadOnly())
     def _(event):
@@ -584,7 +839,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.insert_line_below(
                 copy_margin=not event.cli.in_paste_mode)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle('~', filter=navigation_mode)
     def _(event):
@@ -595,8 +850,25 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         c = buffer.document.current_char
 
         if c is not None and c != '\n':
-            c = (c.upper() if c.islower() else c.lower())
-            buffer.insert_text(c, overwrite=True)
+            buffer.insert_text(c.swapcase(), overwrite=True)
+
+    @handle('g', 'u', 'u', filter=navigation_mode & ~IsReadOnly())
+    def _(event):
+        " Lowercase current line. "
+        buff = event.current_buffer
+        buff.transform_current_line(lambda s: s.lower())
+
+    @handle('g', 'U', 'U', filter=navigation_mode & ~IsReadOnly())
+    def _(event):
+        " Uppercase current line. "
+        buff = event.current_buffer
+        buff.transform_current_line(lambda s: s.upper())
+
+    @handle('g', '~', '~', filter=navigation_mode & ~IsReadOnly())
+    def _(event):
+        " Swap case of the current line. "
+        buff = event.current_buffer
+        buff.transform_current_line(lambda s: s.swapcase())
 
     @handle('#', filter=navigation_mode)
     def _(event):
@@ -629,296 +901,337 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
     @handle('(', filter=navigation_mode)
     def _(event):
         # TODO: go to begin of sentence.
+        # XXX: should become text_object.
         pass
 
     @handle(')', filter=navigation_mode)
     def _(event):
         # TODO: go to end of sentence.
+        # XXX: should become text_object.
         pass
 
-    def change_delete_move_yank_handler(*keys, **kw):
+    operator = create_operator_decorator(registry)
+    text_object = create_text_object_decorator(registry)
+
+    @text_object(Keys.Any, filter=operator_given)
+    def _(event):
         """
-        Register a change/delete/move/yank handlers. e.g.  'dw'/'cw'/'w'/'yw'
-        The decorated function should return a ``CursorRegion``.
-        This decorator will create both the 'change', 'delete' and move variants,
-        based on that ``CursorRegion``.
-
-        When there is nothing selected yet, this will also handle the "visual"
-        binding. E.g. 'viw' should select the current word.
+        Unknown key binding while waiting for a text object.
         """
-        no_move_handler = kw.pop('no_move_handler', False)
+        event.cli.output.bell()
 
-        # TODO: Also do '>' and '<' indent/unindent operators.
-        # TODO: Also "gq": text formatting
-        #  See: :help motion.txt
-        def decorator(func):
-            if not no_move_handler:
-                @handle(*keys, filter=navigation_mode|selection_mode)
-                def move(event):
-                    """ Create move handler. """
-                    region = func(event)
-                    event.current_buffer.cursor_position += region.start
+    #
+    # *** Operators ***
+    #
 
-            def create_transform_handler(transform_func, *a):
-                @handle(*(a + keys), filter=navigation_mode)
-                def _(event):
-                    """ Apply transformation (uppercase, lowercase, rot13, swap case). """
-                    region = func(event)
-                    start, end = region.sorted()
-                    buffer = event.current_buffer
+    def create_delete_and_change_operators(delete_only, with_register=False):
+        """
+        Delete and change operators.
 
-                    # Transform.
-                    buffer.transform_region(
-                        buffer.cursor_position + start,
-                        buffer.cursor_position + end,
-                        transform_func)
+        :param delete_only: Create an operator that deletes, but doesn't go to insert mode.
+        :param with_register: Copy the deleted text to this named register instead of the clipboard.
+        """
+        if with_register:
+            handler_keys = ('"', Keys.Any, 'cd'[delete_only])
+        else:
+            handler_keys = 'cd'[delete_only]
 
-                    # Move cursor
-                    buffer.cursor_position += (region.end or region.start)
+        @operator(*handler_keys, filter=~IsReadOnly())
+        def delete_or_change_operator(event, text_object):
+            clipboard_data = None
+            buff = event.current_buffer
 
-            for k, f in vi_transform_functions:
-                create_transform_handler(f, *k)
+            if text_object:
+                new_document, clipboard_data = text_object.cut(buff)
+                buff.document = new_document
 
-            @handle('y', *keys, filter=navigation_mode)
-            def yank_handler(event):
-                """ Create yank handler. """
-                region = func(event)
-                buffer = event.current_buffer
+            # Set deleted/changed text to clipboard or named register.
+            if clipboard_data and clipboard_data.text:
+                if with_register:
+                    reg_name = event.key_sequence[1].data
+                    if reg_name in vi_register_names:
+                        event.cli.vi_state.named_registers[reg_name] = clipboard_data
+                else:
+                    event.cli.clipboard.set_data(clipboard_data)
 
-                start, end = region.sorted()
-                substring = buffer.text[buffer.cursor_position + start: buffer.cursor_position + end]
+            # Only go back to insert mode in case of 'change'.
+            if not delete_only:
+                event.cli.vi_state.input_mode = InputMode.INSERT
 
-                if substring:
-                    event.cli.clipboard.set_text(substring)
+    create_delete_and_change_operators(False, False)
+    create_delete_and_change_operators(False, True)
+    create_delete_and_change_operators(True, False)
+    create_delete_and_change_operators(True, True)
 
-            @handle('v', *keys, filter=navigation_mode & enable_visual_key)
-            def visual_handler(event):
-                """ Create visual handler. (Enter character selection mode.) """
-                region = func(event)
-                buffer = event.current_buffer
+    def create_transform_handler(filter, transform_func, *a):
+        @operator(*a, filter=filter & ~IsReadOnly())
+        def _(event, text_object):
+            """
+            Apply transformation (uppercase, lowercase, rot13, swap case).
+            """
+            buff = event.current_buffer
+            start, end = text_object.operator_range(buff.document)
 
-                start, end = region.sorted()
-                end += buffer.cursor_position - 1
+            if start < end:
+                # Transform.
+                buff.transform_region(
+                    buff.cursor_position + start,
+                    buff.cursor_position + end,
+                    transform_func)
 
-                buffer.cursor_position += start
-                buffer.start_selection(selection_type=SelectionType.CHARACTERS)
-                buffer.cursor_position = end
+                # Move cursor
+                buff.cursor_position += (text_object.end or text_object.start)
 
-            def create(delete_only):
-                """ Create delete and change handlers. """
-                @handle('cd'[delete_only], *keys, filter=navigation_mode & ~IsReadOnly())
-                @handle('cd'[delete_only], *keys, filter=navigation_mode & ~IsReadOnly())
-                def _(event):
-                    region = func(event)
-                    deleted = ''
-                    buffer = event.current_buffer
+    for k, f, func in vi_transform_functions:
+        create_transform_handler(f, func, *k)
 
-                    if region:
-                        start, end = region.sorted()
+    @operator('y')
+    def yank_handler(event, text_object):
+        """
+        Yank operator. (Copy text.)
+        """
+        _, clipboard_data = text_object.cut(event.current_buffer)
+        if clipboard_data.text:
+            event.cli.clipboard.set_data(clipboard_data)
 
-                        # Move to the start of the region.
-                        buffer.cursor_position += start
+    @operator('"', Keys.Any, 'y')
+    def _(event, text_object):
+        " Yank selection to named register. "
+        c = event.key_sequence[1].data
+        if c in vi_register_names:
+            _, clipboard_data = text_object.cut(event.current_buffer)
+            event.cli.vi_state.named_registers[c] = clipboard_data
 
-                        # Delete until end of region.
-                        deleted = buffer.delete(count=end-start)
+    @operator('>')
+    def _(event, text_object):
+        """
+        Indent.
+        """
+        buff = event.current_buffer
+        from_, to = text_object.get_line_numbers(buff)
+        indent(buff, from_, to + 1, count=event.arg)
 
-                    # Set deleted/changed text to clipboard.
-                    if deleted:
-                        event.cli.clipboard.set_text(deleted)
+    @operator('<')
+    def _(event, text_object):
+        """
+        Unindent.
+        """
+        buff = event.current_buffer
+        from_, to = text_object.get_line_numbers(buff)
+        unindent(buff, from_, to + 1, count=event.arg)
 
-                    # Only go back to insert mode in case of 'change'.
-                    if not delete_only:
-                        get_vi_state(event.cli).input_mode = InputMode.INSERT
+    @operator('g', 'q')
+    def _(event, text_object):
+        """
+        Reshape text.
+        """
+        buff = event.current_buffer
+        from_, to = text_object.get_line_numbers(buff)
+        reshape_text(buff, from_, to)
 
-            create(True)
-            create(False)
-            return func
-        return decorator
+    #
+    # *** Text objects ***
+    #
 
-    @change_delete_move_yank_handler('b')
+    @text_object('b')
     def _(event):
         """ Move one word or token left. """
-        return CursorRegion(event.current_buffer.document.find_start_of_previous_word(count=event.arg) or 0)
+        return TextObject(event.current_buffer.document.find_start_of_previous_word(count=event.arg) or 0)
 
-    @change_delete_move_yank_handler('B')
+    @text_object('B')
     def _(event):
         """ Move one non-blank word left """
-        return CursorRegion(event.current_buffer.document.find_start_of_previous_word(count=event.arg, WORD=True) or 0)
+        return TextObject(event.current_buffer.document.find_start_of_previous_word(count=event.arg, WORD=True) or 0)
 
-    @change_delete_move_yank_handler('$')
+    @text_object('$')
     def key_dollar(event):
         """ 'c$', 'd$' and '$':  Delete/change/move until end of line. """
-        return CursorRegion(event.current_buffer.document.get_end_of_line_position())
+        return TextObject(event.current_buffer.document.get_end_of_line_position())
 
-    @change_delete_move_yank_handler('w')
+    @text_object('w')
     def _(event):
         """ 'word' forward. 'cw', 'dw', 'w': Delete/change/move one word.  """
-        return CursorRegion(event.current_buffer.document.find_next_word_beginning(count=event.arg) or
+        return TextObject(event.current_buffer.document.find_next_word_beginning(count=event.arg) or
                             event.current_buffer.document.get_end_of_document_position())
 
-    @change_delete_move_yank_handler('W')
+    @text_object('W')
     def _(event):
         """ 'WORD' forward. 'cW', 'dW', 'W': Delete/change/move one WORD.  """
-        return CursorRegion(event.current_buffer.document.find_next_word_beginning(count=event.arg, WORD=True) or
+        return TextObject(event.current_buffer.document.find_next_word_beginning(count=event.arg, WORD=True) or
                             event.current_buffer.document.get_end_of_document_position())
 
-    @change_delete_move_yank_handler('e')
+    @text_object('e')
     def _(event):
         """ End of 'word': 'ce', 'de', 'e' """
         end = event.current_buffer.document.find_next_word_ending(count=event.arg)
-        return CursorRegion(end - 1 if end else 0)
+        return TextObject(end - 1 if end else 0, type=TextObjectType.INCLUSIVE)
 
-    @change_delete_move_yank_handler('E')
+    @text_object('E')
     def _(event):
         """ End of 'WORD': 'cE', 'dE', 'E' """
         end = event.current_buffer.document.find_next_word_ending(count=event.arg, WORD=True)
-        return CursorRegion(end - 1 if end else 0)
+        return TextObject(end - 1 if end else 0, type=TextObjectType.INCLUSIVE)
 
-    @change_delete_move_yank_handler('i', 'w', no_move_handler=True)
+    @text_object('i', 'w', no_move_handler=True)
     def _(event):
         """ Inner 'word': ciw and diw """
         start, end = event.current_buffer.document.find_boundaries_of_current_word()
-        return CursorRegion(start, end)
+        return TextObject(start, end)
 
-    @change_delete_move_yank_handler('a', 'w', no_move_handler=True)
+    @text_object('a', 'w', no_move_handler=True)
     def _(event):
         """ A 'word': caw and daw """
         start, end = event.current_buffer.document.find_boundaries_of_current_word(include_trailing_whitespace=True)
-        return CursorRegion(start, end)
+        return TextObject(start, end)
 
-    @change_delete_move_yank_handler('i', 'W', no_move_handler=True)
+    @text_object('i', 'W', no_move_handler=True)
     def _(event):
         """ Inner 'WORD': ciW and diW """
         start, end = event.current_buffer.document.find_boundaries_of_current_word(WORD=True)
-        return CursorRegion(start, end)
+        return TextObject(start, end)
 
-    @change_delete_move_yank_handler('a', 'W', no_move_handler=True)
+    @text_object('a', 'W', no_move_handler=True)
     def _(event):
         """ A 'WORD': caw and daw """
         start, end = event.current_buffer.document.find_boundaries_of_current_word(WORD=True, include_trailing_whitespace=True)
-        return CursorRegion(start, end)
+        return TextObject(start, end)
 
-    @change_delete_move_yank_handler('^')
+    @text_object('a', 'p', no_move_handler=True)
+    def _(event):
+        """
+        Auto paragraph.
+        """
+        start = event.current_buffer.document.start_of_paragraph()
+        end = event.current_buffer.document.end_of_paragraph(count=event.arg)
+        return TextObject(start, end)
+
+    @text_object('^')
     def key_circumflex(event):
         """ 'c^', 'd^' and '^': Soft start of line, after whitespace. """
-        return CursorRegion(event.current_buffer.document.get_start_of_line_position(after_whitespace=True))
+        return TextObject(event.current_buffer.document.get_start_of_line_position(after_whitespace=True))
 
-    @change_delete_move_yank_handler('0', no_move_handler=True)
+    @text_object('0')
     def key_zero(event):
         """
         'c0', 'd0': Hard start of line, before whitespace.
         (The move '0' key is implemented elsewhere, because a '0' could also change the `arg`.)
         """
-        return CursorRegion(event.current_buffer.document.get_start_of_line_position(after_whitespace=False))
+        return TextObject(event.current_buffer.document.get_start_of_line_position(after_whitespace=False))
 
-    def create_ci_ca_handles(ci_start, ci_end, inner):
-                # TODO: 'dab', 'dib', (brackets or block) 'daB', 'diB', Braces.
+    def create_ci_ca_handles(ci_start, ci_end, inner, key=None):
                 # TODO: 'dat', 'dit', (tags (like xml)
         """
         Delete/Change string between this start and stop character. But keep these characters.
         This implements all the ci", ci<, ci{, ci(, di", di<, ca", ca<, ... combinations.
         """
-        @change_delete_move_yank_handler('ai'[inner], ci_start, no_move_handler=True)
-        @change_delete_move_yank_handler('ai'[inner], ci_end, no_move_handler=True)
-        def _(event):
-            start = event.current_buffer.document.find_backwards(ci_start, in_current_line=False)
-            end = event.current_buffer.document.find(ci_end, in_current_line=False)
+        def handler(event):
+            if ci_start == ci_end:
+                # Quotes
+                start = event.current_buffer.document.find_backwards(ci_start, in_current_line=False)
+                end = event.current_buffer.document.find(ci_end, in_current_line=False)
+            else:
+                # Brackets
+                start = event.current_buffer.document.find_enclosing_bracket_left(ci_start, ci_end)
+                end = event.current_buffer.document.find_enclosing_bracket_right(ci_start, ci_end)
 
             if start is not None and end is not None:
                 offset = 0 if inner else 1
-                return CursorRegion(start + 1 - offset, end + offset)
+                return TextObject(start + 1 - offset, end + offset)
             else:
                 # Nothing found.
-                return CursorRegion(0)
+                return TextObject(0)
+
+        if key is None:
+            text_object('ai'[inner], ci_start, no_move_handler=True)(handler)
+            text_object('ai'[inner], ci_end, no_move_handler=True)(handler)
+        else:
+            text_object('ai'[inner], key, no_move_handler=True)(handler)
 
     for inner in (False, True):
         for ci_start, ci_end in [('"', '"'), ("'", "'"), ("`", "`"),
                                  ('[', ']'), ('<', '>'), ('{', '}'), ('(', ')')]:
             create_ci_ca_handles(ci_start, ci_end, inner)
 
-    @change_delete_move_yank_handler('{')
+        create_ci_ca_handles('(', ')', inner, 'b')  # 'dab', 'dib'
+        create_ci_ca_handles('{', '}', inner, 'B')  # 'daB', 'diB'
+
+    @text_object('{')
     def _(event):
         """
         Move to previous blank-line separated section.
         Implements '{', 'c{', 'd{', 'y{'
         """
-        def match_func(text):
-            return not text or text.isspace()
+        index = event.current_buffer.document.start_of_paragraph(
+            count=event.arg, before=True)
+        return TextObject(index)
 
-        line_index = event.current_buffer.document.find_previous_matching_line(
-            match_func=match_func, count=event.arg)
-
-        if line_index:
-            index = event.current_buffer.document.get_cursor_up_position(count=-line_index)
-        else:
-            index = 0
-        return CursorRegion(index)
-
-    @change_delete_move_yank_handler('}')
+    @text_object('}')
     def _(event):
         """
         Move to next blank-line separated section.
         Implements '}', 'c}', 'd}', 'y}'
         """
-        def match_func(text):
-            return not text or text.isspace()
+        index = event.current_buffer.document.end_of_paragraph(count=event.arg, after=True)
+        return TextObject(index)
 
-        line_index = event.current_buffer.document.find_next_matching_line(
-            match_func=match_func, count=event.arg)
-
-        if line_index:
-            index = event.current_buffer.document.get_cursor_down_position(count=line_index)
-        else:
-            index = 0
-
-        return CursorRegion(index)
-
-    @change_delete_move_yank_handler('f', Keys.Any)
+    @text_object('f', Keys.Any)
     def _(event):
         """
         Go to next occurance of character. Typing 'fx' will move the
         cursor to the next occurance of character. 'x'.
         """
-        get_vi_state(event.cli).last_character_find = CharacterFind(event.data, False)
-        match = event.current_buffer.document.find(event.data, in_current_line=True, count=event.arg)
-        return CursorRegion(match or 0)
+        event.cli.vi_state.last_character_find = CharacterFind(event.data, False)
+        match = event.current_buffer.document.find(
+            event.data, in_current_line=True, count=event.arg)
+        if match:
+            return TextObject(match, type=TextObjectType.INCLUSIVE)
+        else:
+            return TextObject(0)
 
-    @change_delete_move_yank_handler('F', Keys.Any)
+    @text_object('F', Keys.Any)
     def _(event):
         """
         Go to previous occurance of character. Typing 'Fx' will move the
         cursor to the previous occurance of character. 'x'.
         """
-        get_vi_state(event.cli).last_character_find = CharacterFind(event.data, True)
-        return CursorRegion(event.current_buffer.document.find_backwards(event.data, in_current_line=True, count=event.arg) or 0)
+        event.cli.vi_state.last_character_find = CharacterFind(event.data, True)
+        return TextObject(event.current_buffer.document.find_backwards(
+            event.data, in_current_line=True, count=event.arg) or 0)
 
-    @change_delete_move_yank_handler('t', Keys.Any)
+    @text_object('t', Keys.Any)
     def _(event):
         """
         Move right to the next occurance of c, then one char backward.
         """
-        get_vi_state(event.cli).last_character_find = CharacterFind(event.data, False)
-        match = event.current_buffer.document.find(event.data, in_current_line=True, count=event.arg)
-        return CursorRegion(match - 1 if match else 0)
+        event.cli.vi_state.last_character_find = CharacterFind(event.data, False)
+        match = event.current_buffer.document.find(
+            event.data, in_current_line=True, count=event.arg)
+        if match:
+            return TextObject(match - 1, type=TextObjectType.INCLUSIVE)
+        else:
+            return TextObject(0)
 
-    @change_delete_move_yank_handler('T', Keys.Any)
+    @text_object('T', Keys.Any)
     def _(event):
         """
         Move left to the previous occurance of c, then one char forward.
         """
-        get_vi_state(event.cli).last_character_find = CharacterFind(event.data, True)
-        match = event.current_buffer.document.find_backwards(event.data, in_current_line=True, count=event.arg)
-        return CursorRegion(match + 1 if match else 0)
+        event.cli.vi_state.last_character_find = CharacterFind(event.data, True)
+        match = event.current_buffer.document.find_backwards(
+            event.data, in_current_line=True, count=event.arg)
+        return TextObject(match + 1 if match else 0)
 
     def repeat(reverse):
         """
         Create ',' and ';' commands.
         """
-        @change_delete_move_yank_handler(',' if reverse else ';')
+        @text_object(',' if reverse else ';')
         def _(event):
             # Repeat the last 'f'/'F'/'t'/'T' command.
             pos = 0
-            vi_state = get_vi_state(event.cli)
+            vi_state = event.cli.vi_state
+
+            type = TextObjectType.EXCLUSIVE
 
             if vi_state.last_character_find:
                 char = vi_state.last_character_find.character
@@ -931,34 +1244,43 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
                     pos = event.current_buffer.document.find_backwards(char, in_current_line=True, count=event.arg)
                 else:
                     pos = event.current_buffer.document.find(char, in_current_line=True, count=event.arg)
-            return CursorRegion(pos or 0)
+                    type = TextObjectType.INCLUSIVE
+            if pos:
+                return TextObject(pos, type=type)
+            else:
+                return TextObject(0)
     repeat(True)
     repeat(False)
 
-    @change_delete_move_yank_handler('h')
-    @change_delete_move_yank_handler(Keys.Left)
+    @text_object('h')
+    @text_object(Keys.Left)
     def _(event):
         """ Implements 'ch', 'dh', 'h': Cursor left. """
-        return CursorRegion(event.current_buffer.document.get_cursor_left_position(count=event.arg))
+        return TextObject(event.current_buffer.document.get_cursor_left_position(count=event.arg))
 
-    @change_delete_move_yank_handler('j', no_move_handler=True)
+    @text_object('j', no_move_handler=True, no_selection_handler=True)
+            # Note: We also need `no_selection_handler`, because we in
+            #       selection mode, we prefer the other 'j' binding that keeps
+            #       `buffer.preferred_column`.
     def _(event):
         """ Implements 'cj', 'dj', 'j', ... Cursor up. """
-        return CursorRegion(event.current_buffer.document.get_cursor_down_position(count=event.arg))
+        return TextObject(event.current_buffer.document.get_cursor_down_position(count=event.arg),
+                          type=TextObjectType.LINEWISE)
 
-    @change_delete_move_yank_handler('k', no_move_handler=True)
+    @text_object('k', no_move_handler=True, no_selection_handler=True)
     def _(event):
         """ Implements 'ck', 'dk', 'k', ... Cursor up. """
-        return CursorRegion(event.current_buffer.document.get_cursor_up_position(count=event.arg))
+        return TextObject(event.current_buffer.document.get_cursor_up_position(count=event.arg),
+                          type=TextObjectType.LINEWISE)
 
-    @change_delete_move_yank_handler('l')
-    @change_delete_move_yank_handler(' ')
-    @change_delete_move_yank_handler(Keys.Right)
+    @text_object('l')
+    @text_object(' ')
+    @text_object(Keys.Right)
     def _(event):
         """ Implements 'cl', 'dl', 'l', 'c ', 'd ', ' '. Cursor right. """
-        return CursorRegion(event.current_buffer.document.get_cursor_right_position(count=event.arg))
+        return TextObject(event.current_buffer.document.get_cursor_right_position(count=event.arg))
 
-    @change_delete_move_yank_handler('H')
+    @text_object('H')
     def _(event):
         """
         Moves to the start of the visible region. (Below the scroll offset.)
@@ -967,7 +1289,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
         b = event.current_buffer
 
-        if w:
+        if w and w.render_info:
             # When we find a Window that has BufferControl showing this window,
             # move to the start of the visible area.
             pos = (b.document.translate_row_col_to_index(
@@ -977,9 +1299,9 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         else:
             # Otherwise, move to the start of the input.
             pos = -len(b.document.text_before_cursor)
-        return CursorRegion(pos)
+        return TextObject(pos, type=TextObjectType.LINEWISE)
 
-    @change_delete_move_yank_handler('M')
+    @text_object('M')
     def _(event):
         """
         Moves cursor to the vertical center of the visible region.
@@ -988,7 +1310,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
         b = event.current_buffer
 
-        if w:
+        if w and w.render_info:
             # When we find a Window that has BufferControl showing this window,
             # move to the center of the visible area.
             pos = (b.document.translate_row_col_to_index(
@@ -998,9 +1320,9 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         else:
             # Otherwise, move to the start of the input.
             pos = -len(b.document.text_before_cursor)
-        return CursorRegion(pos)
+        return TextObject(pos, type=TextObjectType.LINEWISE)
 
-    @change_delete_move_yank_handler('L')
+    @text_object('L')
     def _(event):
         """
         Moves to the end of the visible region. (Above the scroll offset.)
@@ -1008,7 +1330,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
         b = event.current_buffer
 
-        if w:
+        if w and w.render_info:
             # When we find a Window that has BufferControl showing this window,
             # move to the end of the visible area.
             pos = (b.document.translate_row_col_to_index(
@@ -1018,7 +1340,39 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         else:
             # Otherwise, move to the end of the input.
             pos = len(b.document.text_after_cursor)
-        return CursorRegion(pos)
+        return TextObject(pos, type=TextObjectType.LINEWISE)
+
+    @text_object('n', no_move_handler=True)
+    def _(event):
+        " Search next. "
+        buff = event.current_buffer
+        cursor_position = buff.get_search_position(
+            get_search_state(event.cli), include_current_position=False,
+            count=event.arg)
+        return TextObject(cursor_position - buff.cursor_position)
+
+    @handle('n', filter=navigation_mode)
+    def _(event):
+        " Search next in navigation mode. (This goes through the history.) "
+        event.current_buffer.apply_search(
+            get_search_state(event.cli), include_current_position=False,
+            count=event.arg)
+
+    @text_object('N', no_move_handler=True)
+    def _(event):
+        " Search previous. "
+        buff = event.current_buffer
+        cursor_position = buff.get_search_position(
+            ~get_search_state(event.cli), include_current_position=False,
+            count=event.arg)
+        return TextObject(cursor_position - buff.cursor_position)
+
+    @handle('N', filter=navigation_mode)
+    def _(event):
+        " Search previous in navigation mode. (This goes through the history.) "
+        event.current_buffer.apply_search(
+            ~get_search_state(event.cli), include_current_position=False,
+            count=event.arg)
 
     @handle('z', '+', filter=navigation_mode|selection_mode)
     @handle('z', 't', filter=navigation_mode|selection_mode)
@@ -1029,16 +1383,7 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
         b = event.cli.current_buffer
-
-        if w and w.render_info:
-            # Calculate the offset that we need in order to position the row
-            # containing the cursor in the center.
-            cursor_position_row = b.document.cursor_position_row
-
-            render_row = w.render_info.input_line_to_screen_line.get(cursor_position_row)
-            if render_row is not None:
-                w.vertical_scroll = max(0, render_row)
-
+        w.vertical_scroll = b.document.cursor_position_row
 
     @handle('z', '-', filter=navigation_mode|selection_mode)
     @handle('z', 'b', filter=navigation_mode|selection_mode)
@@ -1047,16 +1392,11 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         Scrolls the window to makes the current line the last line in the visible region.
         """
         w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
-        b = event.cli.current_buffer
 
-        if w and w.render_info:
-            # Calculate the offset that we need in order to position the row
-            # containing the cursor in the center.
-            cursor_position_row = b.document.cursor_position_row
-
-            render_row = w.render_info.input_line_to_screen_line.get(cursor_position_row)
-            if render_row is not None:
-                w.vertical_scroll = max(0, (render_row - w.render_info.window_height))
+        # We can safely set the scroll offset to zero; the Window will meke
+        # sure that it scrolls at least enough to make the cursor visible
+        # again.
+        w.vertical_scroll = 0
 
     @handle('z', 'z', filter=navigation_mode|selection_mode)
     def _(event):
@@ -1067,15 +1407,26 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         b = event.cli.current_buffer
 
         if w and w.render_info:
+            info = w.render_info
+
             # Calculate the offset that we need in order to position the row
             # containing the cursor in the center.
-            cursor_position_row = b.document.cursor_position_row
+            scroll_height = info.window_height // 2
 
-            render_row = w.render_info.input_line_to_screen_line.get(cursor_position_row)
-            if render_row is not None:
-                w.vertical_scroll = max(0, int(render_row - w.render_info.window_height / 2))
+            y = max(0, b.document.cursor_position_row - 1)
+            height = 0
+            while y > 0:
+                line_height = info.get_height_for_line(y)
 
-    @change_delete_move_yank_handler('%')
+                if height + line_height < scroll_height:
+                    height += line_height
+                    y -= 1
+                else:
+                    break
+
+            w.vertical_scroll = y
+
+    @text_object('%')
     def _(event):
         """
         Implements 'c%', 'd%', '%, 'y%' (Move to corresponding bracket.)
@@ -1088,22 +1439,26 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
             # row in the file.
             if 0 < event.arg <= 100:
                 absolute_index = buffer.document.translate_row_col_to_index(
-                    int(event.arg * buffer.document.line_count / 100), 0)
-                return CursorRegion(absolute_index - buffer.document.cursor_position)
+                    int((event.arg * buffer.document.line_count - 1) / 100), 0)
+                return TextObject(absolute_index - buffer.document.cursor_position, type=TextObjectType.LINEWISE)
             else:
-                return CursorRegion(0)  # Do nothing.
+                return TextObject(0)  # Do nothing.
 
         else:
             # Move to the corresponding opening/closing bracket (()'s, []'s and {}'s).
-            return CursorRegion(buffer.document.matching_bracket_position)
+            match = buffer.document.find_matching_bracket_position()
+            if match:
+                return TextObject(match, type=TextObjectType.INCLUSIVE)
+            else:
+                return TextObject(0)
 
-    @change_delete_move_yank_handler('|')
+    @text_object('|')
     def _(event):
         # Move to the n-th column (you may specify the argument n by typing
         # it on number keys, for example, 20|).
-        return CursorRegion(event.current_buffer.document.get_column_cursor_position(event.arg))
+        return TextObject(event.current_buffer.document.get_column_cursor_position(event.arg - 1))
 
-    @change_delete_move_yank_handler('g', 'g')
+    @text_object('g', 'g')
     def _(event):
         """
         Implements 'gg', 'cgg', 'ygg'
@@ -1112,45 +1467,66 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
 
         if event._arg:
             # Move to the given line.
-            return CursorRegion(d.translate_row_col_to_index(event.arg - 1, 0) - d.cursor_position)
+            return TextObject(d.translate_row_col_to_index(event.arg - 1, 0) - d.cursor_position, type=TextObjectType.LINEWISE)
         else:
             # Move to the top of the input.
-            return CursorRegion(d.get_start_of_document_position())
+            return TextObject(d.get_start_of_document_position(), type=TextObjectType.LINEWISE)
 
-    @change_delete_move_yank_handler('g', '_')
+    @text_object('g', '_')
     def _(event):
         """
         Go to last non-blank of line.
         'g_', 'cg_', 'yg_', etc..
         """
-        return CursorRegion(
-            event.current_buffer.document.last_non_blank_of_current_line_position())
+        return TextObject(
+            event.current_buffer.document.last_non_blank_of_current_line_position(), type=TextObjectType.INCLUSIVE)
 
-    @change_delete_move_yank_handler('g', 'e')
+    @text_object('g', 'e')
     def _(event):
         """
         Go to last character of previous word.
         'ge', 'cge', 'yge', etc..
         """
-        return CursorRegion(
-            event.current_buffer.document.find_start_of_previous_word(count=event.arg) or 0)
+        prev_end = event.current_buffer.document.find_previous_word_ending(count=event.arg)
+        return TextObject(prev_end - 1 if prev_end is not None else 0, type=TextObjectType.INCLUSIVE)
 
-    @change_delete_move_yank_handler('g', 'E')
+    @text_object('g', 'E')
     def _(event):
         """
         Go to last character of previous WORD.
         'gE', 'cgE', 'ygE', etc..
         """
-        return CursorRegion(
-            event.current_buffer.document.find_start_of_previous_word(
-                count=event.arg, WORD=True) or 0)
+        prev_end = event.current_buffer.document.find_previous_word_ending(count=event.arg, WORD=True)
+        return TextObject(prev_end - 1 if prev_end is not None else 0, type=TextObjectType.INCLUSIVE)
 
-    @change_delete_move_yank_handler('G')
+    @text_object('g', 'm')
+    def _(event):
+        """
+        Like g0, but half a screenwidth to the right. (Or as much as possible.)
+        """
+        w = find_window_for_buffer_name(event.cli, event.cli.current_buffer_name)
+        buff = event.current_buffer
+
+        if w and w.render_info:
+            width = w.render_info.window_width
+            start = buff.document.get_start_of_line_position(after_whitespace=False)
+            start += int(min(width / 2, len(buff.document.current_line)))
+
+            return TextObject(start, type=TextObjectType.INCLUSIVE)
+        return TextObject(0)
+
+    @text_object('G')
     def _(event):
         """
         Go to the end of the document. (If no arg has been given.)
         """
-        return CursorRegion(len(event.current_buffer.document.text_after_cursor))
+        buf = event.current_buffer
+        return TextObject(buf.document.translate_row_col_to_index(buf.document.line_count - 1, 0) -
+                          buf.cursor_position, type=TextObjectType.LINEWISE)
+
+    #
+    # *** Other ***
+    #
 
     @handle('G', filter=HasArg())
     def _(event):
@@ -1160,17 +1536,18 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.go_to_history(event.arg - 1)
 
-    @handle(Keys.Any, filter=navigation_mode)
-    @handle(Keys.Any, filter=selection_mode)
-    def _(event):
-        """
-        Always handle numberics in navigation mode as arg.
-        """
-        if event.data in '123456789' or (event._arg and event.data == '0'):
+    for n in '123456789':
+        @handle(n, filter=navigation_mode|selection_mode|operator_given)
+        def _(event):
+            """
+            Always handle numberics in navigation mode as arg.
+            """
             event.append_to_arg_count(event.data)
-        elif event.data == '0':
-            buffer = event.current_buffer
-            buffer.cursor_position += buffer.document.get_start_of_line_position(after_whitespace=False)
+
+    @handle('0', filter=(navigation_mode|selection_mode|operator_given) & HasArg())
+    def _(event):
+        " Zero when an argument was already give. "
+        event.append_to_arg_count(event.data)
 
     @handle(Keys.Any, filter=replace_mode)
     def _(event):
@@ -1179,18 +1556,103 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         """
         event.current_buffer.insert_text(event.data, overwrite=True)
 
-    def create_selection_transform_handler(keys, transform_func):
+    @handle(Keys.Any, filter=insert_multiple_mode,
+            save_before=(lambda e: not e.is_repeat))
+    def _(event):
         """
-        Apply transformation on selection (uppercase, lowercase, rot13, swap case).
+        Insert data at multiple cursor positions at once.
+        (Usually a result of pressing 'I' or 'A' in block-selection mode.)
         """
-        @handle(*keys, filter=selection_mode)
-        def _(event):
-            range = event.current_buffer.document.selection_range()
-            if range:
-                event.current_buffer.transform_region(range[0], range[1], transform_func)
+        buff = event.current_buffer
+        original_text = buff.text
 
-    for k, f in vi_transform_functions:
-        create_selection_transform_handler(k, f)
+        # Construct new text.
+        text = []
+        p = 0
+
+        for p2 in buff.multiple_cursor_positions:
+            text.append(original_text[p:p2])
+            text.append(event.data)
+            p = p2
+
+        text.append(original_text[p:])
+
+        # Shift all cursor positions.
+        new_cursor_positions = [
+            p + i + 1 for i, p in enumerate(buff.multiple_cursor_positions)]
+
+        # Set result.
+        buff.text = ''.join(text)
+        buff.multiple_cursor_positions = new_cursor_positions
+        buff.cursor_position += 1
+
+    @handle(Keys.Backspace, filter=insert_multiple_mode)
+    def _(event):
+        " Backspace, using multiple cursors. "
+        buff = event.current_buffer
+        original_text = buff.text
+
+        # Construct new text.
+        deleted_something = False
+        text = []
+        p = 0
+
+        for p2 in buff.multiple_cursor_positions:
+            if p2 > 0 and original_text[p2 - 1] != '\n':  # Don't delete across lines.
+                text.append(original_text[p:p2 - 1])
+                deleted_something = True
+            else:
+                text.append(original_text[p:p2])
+            p = p2
+
+        text.append(original_text[p:])
+
+        if deleted_something:
+            # Shift all cursor positions.
+            lengths = [len(part) for part in text[:-1]]
+            new_cursor_positions = list(accumulate(lengths))
+
+            # Set result.
+            buff.text = ''.join(text)
+            buff.multiple_cursor_positions = new_cursor_positions
+            buff.cursor_position -= 1
+        else:
+            event.cli.output.bell()
+
+    @handle(Keys.Delete, filter=insert_multiple_mode)
+    def _(event):
+        " Delete, using multiple cursors. "
+        buff = event.current_buffer
+        original_text = buff.text
+
+        # Construct new text.
+        deleted_something = False
+        text = []
+        new_cursor_positions = []
+        p = 0
+
+        for p2 in buff.multiple_cursor_positions:
+            text.append(original_text[p:p2])
+            if p2 >= len(original_text) or original_text[p2] == '\n':
+                # Don't delete across lines.
+                p = p2
+            else:
+                p = p2 + 1
+                deleted_something = True
+
+        text.append(original_text[p:])
+
+        if deleted_something:
+            # Shift all cursor positions.
+            lengths = [len(part) for part in text[:-1]]
+            new_cursor_positions = list(accumulate(lengths))
+
+            # Set result.
+            buff.text = ''.join(text)
+            buff.multiple_cursor_positions = new_cursor_positions
+        else:
+            event.cli.output.bell()
+
 
     @handle(Keys.ControlX, Keys.ControlL, filter=insert_mode)
     def _(event):
@@ -1208,36 +1670,70 @@ def load_vi_bindings(registry, get_vi_state, enable_visual_key=Always(), get_sea
         # TODO
         pass
 
+    @handle(Keys.ControlK, filter=insert_mode|replace_mode)
+    def _(event):
+        " Go into digraph mode. "
+        event.cli.vi_state.waiting_for_digraph = True
 
-def load_vi_open_in_editor_bindings(registry, get_vi_state, filter=None):
+    @Condition
+    def digraph_symbol_1_given(cli):
+        return cli.vi_state.digraph_symbol1 is not None
+
+    @handle(Keys.Any, filter=digraph_mode & ~digraph_symbol_1_given)
+    def _(event):
+        event.cli.vi_state.digraph_symbol1 = event.data
+
+    @handle(Keys.Any, filter=digraph_mode & digraph_symbol_1_given)
+    def _(event):
+        " Insert digraph. "
+        try:
+            # Lookup.
+            code = (event.cli.vi_state.digraph_symbol1, event.data)
+            if code not in DIGRAPHS:
+                code = code[::-1]  # Try reversing.
+            symbol = DIGRAPHS[code]
+        except KeyError:
+            # Unkown digraph.
+            event.cli.output.bell()
+        else:
+            # Insert digraph.
+            overwrite = event.cli.vi_state.input_mode == InputMode.REPLACE
+            event.current_buffer.insert_text(
+                six.unichr(symbol), overwrite=overwrite)
+            event.cli.vi_state.waiting_for_digraph = False
+        finally:
+            event.cli.vi_state.waiting_for_digraph = False
+            event.cli.vi_state.digraph_symbol1 = None
+
+    return registry
+
+
+def load_vi_open_in_editor_bindings():
     """
     Pressing 'v' in navigation mode will open the buffer in an external editor.
     """
-    assert callable(get_vi_state)
+    registry = Registry()
+    navigation_mode = ViNavigationMode()
 
-    navigation_mode = ViStateFilter(get_vi_state, InputMode.NAVIGATION) & ~ filters.HasSelection()
-    handle = create_handle_decorator(registry, filter)
-
-    @handle('v', filter=navigation_mode)
-    def _(event):
-        event.current_buffer.open_in_editor(event.cli)
+    registry.add_binding('v', filter=navigation_mode)(
+        get_by_name('edit-and-execute-command'))
+    return registry
 
 
-def load_vi_system_bindings(registry, get_vi_state, filter=None):
-    assert callable(get_vi_state)
+def load_vi_system_bindings():
+    registry = ConditionalRegistry(Registry(), ViMode())
+    handle = registry.add_binding
 
     has_focus = filters.HasFocus(SYSTEM_BUFFER)
-    navigation_mode = ViStateFilter(get_vi_state, InputMode.NAVIGATION) & ~ filters.HasSelection()
-
-    handle = create_handle_decorator(registry, filter)
+    navigation_mode = ViNavigationMode()
 
     @handle('!', filter=~has_focus & navigation_mode)
     def _(event):
         """
         '!' opens the system prompt.
         """
-        event.cli.focus_stack.push(SYSTEM_BUFFER)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.push_focus(SYSTEM_BUFFER)
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle(Keys.Escape, filter=has_focus)
     @handle(Keys.ControlC, filter=has_focus)
@@ -1245,38 +1741,46 @@ def load_vi_system_bindings(registry, get_vi_state, filter=None):
         """
         Cancel system prompt.
         """
-        get_vi_state(event.cli).input_mode = InputMode.NAVIGATION
+        event.cli.vi_state.input_mode = InputMode.NAVIGATION
         event.cli.buffers[SYSTEM_BUFFER].reset()
-        event.cli.focus_stack.pop()
+        event.cli.pop_focus()
 
     @handle(Keys.ControlJ, filter=has_focus)
     def _(event):
         """
         Run system command.
         """
-        get_vi_state(event.cli).input_mode = InputMode.NAVIGATION
+        event.cli.vi_state.input_mode = InputMode.NAVIGATION
 
         system_buffer = event.cli.buffers[SYSTEM_BUFFER]
         event.cli.run_system_command(system_buffer.text)
         system_buffer.reset(append_to_history=True)
 
         # Focus previous buffer again.
-        event.cli.focus_stack.pop()
+        event.cli.pop_focus()
+
+    return registry
 
 
-def load_vi_search_bindings(registry, get_vi_state, get_search_state=None,
-                            filter=None, search_buffer_name=SEARCH_BUFFER):
-    assert callable(get_vi_state)  # Callable that takes a CLI and returns a ViState.
+def load_vi_search_bindings(get_search_state=None,
+                            search_buffer_name=SEARCH_BUFFER):
     assert get_search_state is None or callable(get_search_state)
 
     if not get_search_state:
         def get_search_state(cli): return cli.search_state
 
-    has_focus = filters.HasFocus(search_buffer_name)
-    navigation_mode = ~has_focus & (ViStateFilter(get_vi_state, InputMode.NAVIGATION) | filters.HasSelection())
-    handle = create_handle_decorator(registry, filter)
+    registry = ConditionalRegistry(Registry(), ViMode())
+    handle = registry.add_binding
 
-    @handle('/', filter=navigation_mode)
+    has_focus = filters.HasFocus(search_buffer_name)
+    navigation_mode = ViNavigationMode()
+    selection_mode = ViSelectionMode()
+
+    reverse_vi_search_direction = Condition(
+        lambda cli: cli.application.reverse_vi_search_direction(cli))
+
+    @handle('/', filter=(navigation_mode|selection_mode)&~reverse_vi_search_direction)
+    @handle('?', filter=(navigation_mode|selection_mode)&reverse_vi_search_direction)
     @handle(Keys.ControlS, filter=~has_focus)
     def _(event):
         """
@@ -1284,12 +1788,13 @@ def load_vi_search_bindings(registry, get_vi_state, get_search_state=None,
         """
         # Set the ViState.
         get_search_state(event.cli).direction = IncrementalSearchDirection.FORWARD
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
         # Focus search buffer.
-        event.cli.focus_stack.push(search_buffer_name)
+        event.cli.push_focus(search_buffer_name)
 
-    @handle('?', filter=navigation_mode)
+    @handle('?', filter=(navigation_mode|selection_mode)&~reverse_vi_search_direction)
+    @handle('/', filter=(navigation_mode|selection_mode)&reverse_vi_search_direction)
     @handle(Keys.ControlR, filter=~has_focus)
     def _(event):
         """
@@ -1299,15 +1804,15 @@ def load_vi_search_bindings(registry, get_vi_state, get_search_state=None,
         get_search_state(event.cli).direction = IncrementalSearchDirection.BACKWARD
 
         # Focus search buffer.
-        event.cli.focus_stack.push(search_buffer_name)
-        get_vi_state(event.cli).input_mode = InputMode.INSERT
+        event.cli.push_focus(search_buffer_name)
+        event.cli.vi_state.input_mode = InputMode.INSERT
 
     @handle(Keys.ControlJ, filter=has_focus)
     def _(event):
         """
         Apply the search. (At the / or ? prompt.)
         """
-        input_buffer = event.cli.buffers[event.cli.focus_stack.previous]
+        input_buffer = event.cli.buffers.previous(event.cli)
         search_buffer = event.cli.buffers[search_buffer_name]
 
         # Update search state.
@@ -1322,8 +1827,31 @@ def load_vi_search_bindings(registry, get_vi_state, get_search_state=None,
         search_buffer.reset()
 
         # Focus previous document again.
-        get_vi_state(event.cli).input_mode = InputMode.NAVIGATION
-        event.cli.focus_stack.pop()
+        event.cli.vi_state.input_mode = InputMode.NAVIGATION
+        event.cli.pop_focus()
+
+    def incremental_search(cli, direction, count=1):
+        " Apply search, but keep search buffer focussed. "
+        # Update search_state.
+        search_state = get_search_state(cli)
+        direction_changed = search_state.direction != direction
+
+        search_state.text = cli.buffers[search_buffer_name].text
+        search_state.direction = direction
+
+        # Apply search to current buffer.
+        if not direction_changed:
+            input_buffer = cli.buffers.previous(cli)
+            input_buffer.apply_search(search_state,
+                                      include_current_position=False, count=count)
+
+    @handle(Keys.ControlR, filter=has_focus)
+    def _(event):
+        incremental_search(event.cli, IncrementalSearchDirection.BACKWARD, count=event.arg)
+
+    @handle(Keys.ControlS, filter=has_focus)
+    def _(event):
+        incremental_search(event.cli, IncrementalSearchDirection.FORWARD, count=event.arg)
 
     def search_buffer_is_empty(cli):
         """ Returns True when the search buffer is empty. """
@@ -1331,23 +1859,27 @@ def load_vi_search_bindings(registry, get_vi_state, get_search_state=None,
 
     @handle(Keys.Escape, filter=has_focus)
     @handle(Keys.ControlC, filter=has_focus)
+    @handle(Keys.ControlH, filter=has_focus & Condition(search_buffer_is_empty))
     @handle(Keys.Backspace, filter=has_focus & Condition(search_buffer_is_empty))
     def _(event):
         """
         Cancel search.
         """
-        get_vi_state(event.cli).input_mode = InputMode.NAVIGATION
+        event.cli.vi_state.input_mode = InputMode.NAVIGATION
 
-        event.cli.focus_stack.pop()
+        event.cli.pop_focus()
         event.cli.buffers[search_buffer_name].reset()
 
+    return registry
 
-def load_extra_vi_page_navigation_bindings(registry, filter=None):
+
+def load_extra_vi_page_navigation_bindings():
     """
     Key bindings, for scrolling up and down through pages.
     This are separate bindings, because GNU readline doesn't have them.
     """
-    handle = create_handle_decorator(registry, filter)
+    registry = ConditionalRegistry(Registry(), ViMode())
+    handle = registry.add_binding
 
     handle(Keys.ControlF)(scroll_forward)
     handle(Keys.ControlB)(scroll_backward)
@@ -1357,3 +1889,15 @@ def load_extra_vi_page_navigation_bindings(registry, filter=None):
     handle(Keys.ControlY)(scroll_one_line_up)
     handle(Keys.PageDown)(scroll_page_down)
     handle(Keys.PageUp)(scroll_page_up)
+
+    return registry
+
+
+class ViStateFilter(Filter):
+    " Deprecated! "
+    def __init__(self, get_vi_state, mode):
+        self.get_vi_state = get_vi_state
+        self.mode = mode
+
+    def __call__(self, cli):
+        return self.get_vi_state(cli).input_mode == self.mode

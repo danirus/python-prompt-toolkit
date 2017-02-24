@@ -34,3 +34,9 @@ nosetests.xml
 .mr.developer.cfg
 .project
 .pydevproject
+
+# Generated documentation
+docs/_build
+
+# pycharm metadata
+.idea
